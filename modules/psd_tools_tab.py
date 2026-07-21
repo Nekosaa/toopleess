@@ -1,4 +1,3 @@
-"""PSD Tools tab – Photoshop COM integration (Windows only)."""
 from __future__ import annotations
 
 import json
@@ -16,6 +15,41 @@ LogFn = Callable[[str, str], None]
 
 def _is_windows() -> bool:
     return sys.platform.startswith("win")
+
+
+# ---------------------------------------------------------------------------
+# Layer-type helpers (robust across Photoshop builds / locales)
+# ---------------------------------------------------------------------------
+def _is_group(layer) -> bool:
+    """LayerSet detection via duck-typing: groups have a .Layers collection.
+
+    Строковое сравнение layer.Typename == "LayerSet" на разных сборках
+    Photoshop COM возвращает разное (регистр / int / локализованное имя),
+    поэтому надёжнее пробовать доступ к .Layers.Count.
+    """
+    try:
+        _ = layer.Layers.Count
+        return True
+    except Exception:
+        pass
+    try:
+        return "layerset" in str(getattr(layer, "Typename", "")).lower()
+    except Exception:
+        return False
+
+
+def _is_smart_object(layer) -> bool:
+    """LayerKind.SMARTOBJECT = 17 в Photoshop COM."""
+    try:
+        k = getattr(layer, "Kind", None)
+        if k is not None and int(k) == 17:
+            return True
+    except Exception:
+        pass
+    try:
+        return "smart" in str(getattr(layer, "Typename", "")).lower()
+    except Exception:
+        return False
 
 
 class PhotoshopBridge:
@@ -68,12 +102,7 @@ class PhotoshopBridge:
     def active_document(self):
         return self.app.ActiveDocument
 
-    # ---- patch: connection health checks --------------------------------
     def is_alive(self) -> bool:
-        """Ping Photoshop through a cheap COM property access.
-
-        Returns False if the COM session is dead
-        (RPC_S_SERVER_UNAVAILABLE / -2147023174 and similar)."""
         if not self.available or self.app is None:
             return False
         try:
@@ -83,7 +112,6 @@ class PhotoshopBridge:
             return False
 
     def reset(self) -> None:
-        """Drop the dead COM reference so the next _ensure_ps() rebuilds it."""
         self.app = None
         self.available = False
         self._init_error = "Photoshop COM session lost"
@@ -104,7 +132,6 @@ class PsdToolsFrame(ttk.Frame):
         self._in_var = tk.StringVar(value=config.get("psd_in_dir"))
         self._out_var = tk.StringVar(value=config.get("psd_out_dir"))
 
-        # Persist UI state on every change so the next launch restores it.
         self._mode_var.trace_add("write",
             lambda *_: config.set("psd_mode", self._mode_var.get()))
         self._no_upscale_var.trace_add("write",
@@ -123,7 +150,6 @@ class PsdToolsFrame(ttk.Frame):
         self.columnconfigure(1, weight=1)
         self.rowconfigure(1, weight=1)
 
-        # Toolbar
         toolbar = ttk.Frame(self)
         toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
 
@@ -134,7 +160,6 @@ class PsdToolsFrame(ttk.Frame):
         for i, b in enumerate((self._btn_open, self._btn_scan, self._btn_unlck, self._btn_repl)):
             b.grid(row=0, column=i, padx=(0, 6))
 
-        # Left – layers list
         left = ttk.Frame(self)
         left.grid(row=1, column=0, sticky="ns", padx=(0, 12))
 
@@ -148,7 +173,6 @@ class PsdToolsFrame(ttk.Frame):
         sb = ttk.Scrollbar(left, orient="vertical", command=self._listbox.yview)
         self._listbox.configure(yscrollcommand=sb.set)
 
-        # Right – actions + batch
         right = ttk.Frame(self)
         right.grid(row=1, column=1, sticky="nsew")
         right.columnconfigure(1, weight=1)
@@ -173,7 +197,6 @@ class PsdToolsFrame(ttk.Frame):
                                         foreground="#888", wraplength=520, justify="left")
         self._lbl_mode_hint.grid(row=2, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
-        # --- extra options: preserved between launches ---------------------
         self._cb_no_upscale = ttk.Checkbutton(
             right, text=i18n.t("psd.no.upscale"),
             variable=self._no_upscale_var,
@@ -212,7 +235,6 @@ class PsdToolsFrame(ttk.Frame):
                                      command=self.batch_replace)
         self._btn_batch.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(12, 0))
 
-        # Warning banner
         self._warn = ttk.Label(self, text="", foreground="#c05555")
         self._warn.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
@@ -222,11 +244,7 @@ class PsdToolsFrame(ttk.Frame):
             var.set(chosen)
             config.set(cfg_key, chosen)
 
-    # ------------------------------------------------------------------
-    # Photoshop init (lazy)
-    # ------------------------------------------------------------------
     def _ensure_ps(self) -> bool:
-        # Recreate the bridge if we have none or the COM session is dead.
         if self._ps is None or not self._ps.is_alive():
             if self._ps is not None and not self._ps.is_alive():
                 self._log("Photoshop connection lost – reconnecting…", "warn")
@@ -255,9 +273,6 @@ class PsdToolsFrame(ttk.Frame):
             pass
         return True
 
-    # ------------------------------------------------------------------
-    # File
-    # ------------------------------------------------------------------
     def open_psd(self) -> None:
         import time
 
@@ -322,9 +337,6 @@ class PsdToolsFrame(ttk.Frame):
         messagebox.showerror(i18n.t("error.title"), f"{msg}{hint}")
         self._log(msg, "error")
 
-    # ------------------------------------------------------------------
-    # Scan / unlock
-    # ------------------------------------------------------------------
     def scan_layers(self) -> None:
         if not self._ensure_ps() or self._doc is None:
             self._log(i18n.t("psd.no.file"), "warn")
@@ -341,56 +353,59 @@ class PsdToolsFrame(ttk.Frame):
         except Exception:
             return
         for i in range(1, layer_count + 1):
-            layer = container.Layers.Item(i)
+            try:
+                layer = container.Layers.Item(i)
+            except Exception:
+                continue
+
             name = getattr(layer, "Name", f"Layer {i}")
             indent = "  " * depth
-            try:
-                kind = getattr(layer, "Kind", None)  # 17 = smart object
-            except Exception:
-                kind = None
-            marker = "  [SO]" if kind == 17 else ""
+
+            is_group = _is_group(layer)
+            is_so = (not is_group) and _is_smart_object(layer)
+
+            marker = ""
+            if is_group:
+                marker = "  [G]"
+            elif is_so:
+                marker = "  [SO]"
+
             self._listbox.insert("end", f"{indent}{name}{marker}")
             self._layers_index.append((name, path + [i]))
 
-            try:
-                is_group = layer.Typename == "LayerSet"
-            except Exception:
-                is_group = False
-            if is_group and depth < max_depth:
+            if is_group:
                 self._walk(layer, path + [i], depth + 1, max_depth)
 
     def unlock_all(self) -> None:
         if not self._ensure_ps() or self._doc is None:
             self._log(i18n.t("psd.no.file"), "warn")
             return
-        count = self._unlock_recursive(self._doc, depth=0,
-                                       max_depth=int(config.get("smart_object_depth", 3)))
+        count = self._unlock_recursive(self._doc)
         self._log(f"Unlocked {count} layers", "ok")
 
-    def _unlock_recursive(self, container, depth: int, max_depth: int) -> int:
+    def _unlock_recursive(self, container) -> int:
         unlocked = 0
         try:
             layer_count = container.Layers.Count
         except Exception:
             return 0
         for i in range(1, layer_count + 1):
-            layer = container.Layers.Item(i)
+            try:
+                layer = container.Layers.Item(i)
+            except Exception:
+                continue
+
             for prop in ("AllLocked", "PixelsLocked", "PositionLocked", "TransparentPixelsLocked"):
                 try:
                     setattr(layer, prop, False)
                     unlocked += 1
                 except Exception:
                     pass
-            try:
-                if layer.Typename == "LayerSet" and depth < max_depth:
-                    unlocked += self._unlock_recursive(layer, depth + 1, max_depth)
-            except Exception:
-                pass
+
+            if _is_group(layer):
+                unlocked += self._unlock_recursive(layer)
         return unlocked
 
-    # ------------------------------------------------------------------
-    # Replace photo in Smart Object
-    # ------------------------------------------------------------------
     def replace_in_selected(self) -> None:
         if not self._ensure_ps() or self._doc is None:
             self._log(i18n.t("psd.no.file"), "warn")
@@ -435,55 +450,63 @@ class PsdToolsFrame(ttk.Frame):
             self._run_merge_down_jsx(image_path, mode)
             so_doc.Save()
         finally:
-            so_doc.Close(2)  # 2 = SaveOptions.DONOTSAVECHANGES
+            so_doc.Close(2)
 
     def _activate_target_raster_in_active_doc(self) -> None:
         jsx = r"""
         (function () {
             var doc = app.activeDocument;
-            function pick(container) {
+
+            function bboxOk(L) {
+                try {
+                    var b = L.bounds;
+                    var w = b[2].as('px') - b[0].as('px');
+                    var h = b[3].as('px') - b[1].as('px');
+                    return (w > 0 && h > 0);
+                } catch (e) { return false; }
+            }
+            function isSO(L) {
+                try { return L.kind === LayerKind.SMARTOBJECT; } catch(e){ return false; }
+            }
+
+            // 1st pass: обычный растр с непустыми bounds
+            function pickStrict(container) {
                 for (var i = 0; i < container.artLayers.length; i++) {
                     var L = container.artLayers[i];
-                    try {
-                        if (L.kind === LayerKind.SMARTOBJECT) continue;
-                    } catch (e) {}
-                    try {
-                        var b = L.bounds;
-                        var w = b[2].as('px') - b[0].as('px');
-                        var h = b[3].as('px') - b[1].as('px');
-                        if (w > 0 && h > 0) return L;
-                    } catch (e) { return L; }
+                    if (isSO(L)) continue;
+                    if (bboxOk(L)) return L;
                 }
-                if (container.artLayers.length > 0) return container.artLayers[0];
                 for (var g = 0; g < container.layerSets.length; g++) {
-                    var found = pick(container.layerSets[g]);
-                    if (found) return found;
+                    var f = pickStrict(container.layerSets[g]);
+                    if (f) return f;
                 }
                 return null;
             }
-            var target = pick(doc);
+            // 2nd pass: любой не-SO слой, даже с пустыми bounds
+            function pickAny(container) {
+                for (var i = 0; i < container.artLayers.length; i++) {
+                    var L = container.artLayers[i];
+                    if (!isSO(L)) return L;
+                }
+                for (var g = 0; g < container.layerSets.length; g++) {
+                    var f = pickAny(container.layerSets[g]);
+                    if (f) return f;
+                }
+                if (container.artLayers.length > 0) return container.artLayers[0];
+                return null;
+            }
+
+            var target = pickStrict(doc) || pickAny(doc);
             if (target) doc.activeLayer = target;
         })();
         """
         self._ps.app.DoJavaScript(jsx)
 
     def _replace_layer_content(self, layer, image_path: str, mode: str) -> None:
-        try:
-            kind = getattr(layer, "Kind", None)  # 17 = SmartObjectLayer
-        except Exception:
-            kind = None
-        try:
-            typename = getattr(layer, "Typename", "")
-        except Exception:
-            typename = ""
-
-        is_smart_object = (kind == 17)
-        is_group = (typename == "LayerSet")
-
-        if is_group:
+        if _is_group(layer):
             raise RuntimeError("Selected item is a group (LayerSet), not a photo layer.")
 
-        if is_smart_object:
+        if _is_smart_object(layer):
             self._replace_smart_object(layer, image_path, mode)
         else:
             self._replace_raster_merge_down(layer, image_path, mode)
@@ -493,15 +516,6 @@ class PsdToolsFrame(ttk.Frame):
         self._run_merge_down_jsx(image_path, mode)
 
     def _run_merge_down_jsx(self, image_path: str, mode: str) -> None:
-        """Core merge-down algorithm — runs on the CURRENTLY ACTIVE layer
-        of the CURRENTLY ACTIVE document.
-
-        Preserves: layer name, blend mode, opacity + fill opacity, layer effects.
-
-        Extra options (persisted in config, read at call time):
-             • psd_no_upscale       – clamp scale <= 1.0 (fit / fill only)
-             • psd_clip_to_bounds   – clear placed pixels outside target bounds
-        """
         path_literal = json.dumps(str(Path(image_path)))
         mode_literal = json.dumps(mode)
         no_upscale_literal = "true" if bool(config.get("psd_no_upscale", True)) else "false"
@@ -530,10 +544,20 @@ class PsdToolsFrame(ttk.Frame):
             var L = asPx(b[0]), T = asPx(b[1]), R = asPx(b[2]), Bt = asPx(b[3]);
             var W = R - L, H = Bt - T;
 
+            // Fallback: если у слоя нет пикселей (маска/пустой растр внутри SO)
+            // — используем канвас документа как рамку.
+            if (W <= 0 || H <= 0) {
+                L  = 0;
+                T  = 0;
+                R  = asPx(doc.width);
+                Bt = asPx(doc.height);
+                W  = R - L;
+                H  = Bt - T;
+            }
             if (W <= 0 || H <= 0) {
                 app.preferences.rulerUnits = savedRulerUnits;
                 app.preferences.typeUnits  = savedTypeUnits;
-                throw new Error("Target layer has empty bounds; nothing to replace.");
+                throw new Error("Both target layer and document have empty bounds.");
             }
 
             try { target.allLocked                = false; } catch(e) {}
@@ -564,7 +588,6 @@ class PsdToolsFrame(ttk.Frame):
                 } else {
                     scale = Math.min(W / pw, H / ph);
                 }
-                // "Don't upscale" – keep sharpness of small photos.
                 if (NO_UPSCALE && scale > 1.0) scale = 1.0;
                 var pct = scale * 100.0;
                 placed.resize(pct, pct, AnchorPosition.MIDDLECENTER);
@@ -579,8 +602,6 @@ class PsdToolsFrame(ttk.Frame):
 
             try { placed.rasterize(RasterizeType.ENTIRELAYER); } catch(e) {}
 
-            // Clip placed to target's rectangular bounds → result stays
-            // exactly inside the old rectangle "as if nothing was replaced".
             if (CLIP) {
                 try {
                     doc.selection.select(
@@ -594,8 +615,6 @@ class PsdToolsFrame(ttk.Frame):
                 } catch(e) {}
             }
 
-            // Merge Down onto target – preserves target's name, blend mode,
-            // opacity and effects.
             placed.merge();
 
             try { doc.activeLayer.name = targetName; } catch(e) {}
@@ -611,9 +630,6 @@ class PsdToolsFrame(ttk.Frame):
                .replace("__CLIP__", clip_literal))
         self._ps.app.DoJavaScript(jsx)
 
-    # ------------------------------------------------------------------
-    # Batch replace
-    # ------------------------------------------------------------------
     def batch_replace(self) -> None:
         if not self._ensure_ps():
             return
@@ -650,9 +666,6 @@ class PsdToolsFrame(ttk.Frame):
                 self._log(f"{img.name}: {exc}", "error")
         self._log(i18n.t("psd.done"), "ok")
 
-    # ------------------------------------------------------------------
-    # i18n
-    # ------------------------------------------------------------------
     def _retranslate(self) -> None:
         pairs = [
             (self._btn_open,  "psd.open"),
