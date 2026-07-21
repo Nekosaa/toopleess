@@ -21,12 +21,7 @@ def _is_windows() -> bool:
 # Layer-type helpers (robust across Photoshop builds / locales)
 # ---------------------------------------------------------------------------
 def _is_group(layer) -> bool:
-    """LayerSet detection via duck-typing: groups have a .Layers collection.
-
-    Строковое сравнение layer.Typename == "LayerSet" на разных сборках
-    Photoshop COM возвращает разное (регистр / int / локализованное имя),
-    поэтому надёжнее пробовать доступ к .Layers.Count.
-    """
+    """LayerSet detection via duck-typing: groups have a .Layers collection."""
     try:
         _ = layer.Layers.Count
         return True
@@ -457,32 +452,41 @@ class PsdToolsFrame(ttk.Frame):
         (function () {
             var doc = app.activeDocument;
 
-            function bboxOk(L) {
+            function asPx(v){ try { return v.as('px'); } catch(e){ return Number(v); } }
+            function area(L) {
                 try {
                     var b = L.bounds;
-                    var w = b[2].as('px') - b[0].as('px');
-                    var h = b[3].as('px') - b[1].as('px');
-                    return (w > 0 && h > 0);
-                } catch (e) { return false; }
+                    var w = asPx(b[2]) - asPx(b[0]);
+                    var h = asPx(b[3]) - asPx(b[1]);
+                    if (w <= 0 || h <= 0) return 0;
+                    return w * h;
+                } catch (e) { return 0; }
             }
             function isSO(L) {
                 try { return L.kind === LayerKind.SMARTOBJECT; } catch(e){ return false; }
             }
 
-            // 1st pass: обычный растр с непустыми bounds
-            function pickStrict(container) {
+            // pickBiggest: рекурсивно ищем самый большой НЕ-SO слой по площади
+            // bounds. Это самый надёжный способ найти "главный" растровый слой
+            // внутри смарт-объекта, когда там есть служебные мелкие слои.
+            var best = null;
+            var bestArea = -1;
+            function walkBiggest(container) {
                 for (var i = 0; i < container.artLayers.length; i++) {
                     var L = container.artLayers[i];
                     if (isSO(L)) continue;
-                    if (bboxOk(L)) return L;
+                    var a = area(L);
+                    if (a > bestArea) { bestArea = a; best = L; }
                 }
                 for (var g = 0; g < container.layerSets.length; g++) {
-                    var f = pickStrict(container.layerSets[g]);
-                    if (f) return f;
+                    walkBiggest(container.layerSets[g]);
                 }
-                return null;
             }
-            // 2nd pass: любой не-SO слой, даже с пустыми bounds
+            walkBiggest(doc);
+
+            // Fallback: если ни у одного слоя нет непустых bounds — берём
+            // первый не-SO (в т.ч. пустой), последний шанс — просто первый
+            // artLayer какой есть.
             function pickAny(container) {
                 for (var i = 0; i < container.artLayers.length; i++) {
                     var L = container.artLayers[i];
@@ -496,7 +500,7 @@ class PsdToolsFrame(ttk.Frame):
                 return null;
             }
 
-            var target = pickStrict(doc) || pickAny(doc);
+            var target = best || pickAny(doc);
             if (target) doc.activeLayer = target;
         })();
         """
@@ -544,6 +548,11 @@ class PsdToolsFrame(ttk.Frame):
             var L = asPx(b[0]), T = asPx(b[1]), R = asPx(b[2]), Bt = asPx(b[3]);
             var W = R - L, H = Bt - T;
 
+            // Диагностический размер target ДО fallback на канвас — вернём
+            // в Python для лога, чтобы сразу видеть, тот ли слой выбран.
+            var diagW = W, diagH = H;
+            var usedCanvas = false;
+
             // Fallback: если у слоя нет пикселей (маска/пустой растр внутри SO)
             // — используем канвас документа как рамку.
             if (W <= 0 || H <= 0) {
@@ -553,6 +562,7 @@ class PsdToolsFrame(ttk.Frame):
                 Bt = asPx(doc.height);
                 W  = R - L;
                 H  = Bt - T;
+                usedCanvas = true;
             }
             if (W <= 0 || H <= 0) {
                 app.preferences.rulerUnits = savedRulerUnits;
@@ -588,7 +598,9 @@ class PsdToolsFrame(ttk.Frame):
                 } else {
                     scale = Math.min(W / pw, H / ph);
                 }
-                if (NO_UPSCALE && scale > 1.0) scale = 1.0;
+                // Если target был пустой (usedCanvas) — игнорируем NO_UPSCALE,
+                // иначе маленькая картинка не растянется на холст плейсхолдера.
+                if (NO_UPSCALE && !usedCanvas && scale > 1.0) scale = 1.0;
                 var pct = scale * 100.0;
                 placed.resize(pct, pct, AnchorPosition.MIDDLECENTER);
             }
@@ -615,12 +627,38 @@ class PsdToolsFrame(ttk.Frame):
                 } catch(e) {}
             }
 
-            placed.merge();
+            // Основной путь — слить placed вниз в target (сохраняет позицию
+            // в стеке, эффекты и режим наложения исходного слоя).
+            // Fallback: если merge недоступен (Photoshop error 8800 —
+            // "Команда 'Объединить слои' в данный момент недоступна", например
+            // когда под placed нет подходящего растрового слоя — только
+            // Background/SO/один слой внутри смарт-объекта), удаляем старый
+            // target и оставляем placed как замену. Для Background слоя
+            // предварительно снимаем isBackgroundLayer, иначе .remove() падает.
+            var mergeStatus = "MERGED";
+            try {
+                placed.merge();
+            } catch (mergeErr) {
+                mergeStatus = "FALLBACK";
+                try {
+                    doc.activeLayer = target;
+                    try { target.isBackgroundLayer = false; } catch(e) {}
+                    try { target.allLocked               = false; } catch(e) {}
+                    try { target.pixelsLocked            = false; } catch(e) {}
+                    try { target.positionLocked          = false; } catch(e) {}
+                    try { target.transparentPixelsLocked = false; } catch(e) {}
+                    target.remove();
+                } catch (rmErr) {}
+                try { doc.activeLayer = placed; } catch(e) {}
+            }
 
             try { doc.activeLayer.name = targetName; } catch(e) {}
 
             app.preferences.rulerUnits = savedRulerUnits;
             app.preferences.typeUnits  = savedTypeUnits;
+
+            // Возвращаем строку с диагностикой: STATUS|W|H|usedCanvas
+            return mergeStatus + "|" + diagW + "|" + diagH + "|" + (usedCanvas ? "1" : "0");
         })();
         """
         jsx = (jsx
@@ -628,7 +666,34 @@ class PsdToolsFrame(ttk.Frame):
                .replace("__MODE__", mode_literal)
                .replace("__NO_UPSCALE__", no_upscale_literal)
                .replace("__CLIP__", clip_literal))
-        self._ps.app.DoJavaScript(jsx)
+        try:
+            result = self._ps.app.DoJavaScript(jsx)
+        except Exception:
+            raise
+        status_raw = str(result).strip() if result is not None else ""
+        parts = status_raw.split("|")
+        status = parts[0] if parts else ""
+        diag_w = parts[1] if len(parts) > 1 else "?"
+        diag_h = parts[2] if len(parts) > 2 else "?"
+        used_canvas = parts[3] == "1" if len(parts) > 3 else False
+        self._log(
+            f"target bounds: {diag_w}x{diag_h}px"
+            + (" (fallback → canvas, NO_UPSCALE ignored)" if used_canvas else ""),
+            "info",
+        )
+        if used_canvas:
+            self._log(
+                "target был пустой (0×0). Возможно, выбран слой-плейсхолдер, "
+                "а не смарт-объект. Проверь в списке слоёв — нужен пункт с "
+                "маркером [SO]",
+                "warn",
+            )
+        if status == "FALLBACK":
+            self._log(
+                "merge_down unavailable (PS 8800): исходный слой удалён, "
+                "placed оставлен как замена",
+                "warn",
+            )
 
     def batch_replace(self) -> None:
         if not self._ensure_ps():
