@@ -1,0 +1,6 @@
+PyMuPDF>=1.24.0
+Pillow>=10.0.0
+sv-ttk>=2.6.0
+darkdetect>=0.8.0
+pywin32>=306; sys_platform == "win32"
+pyinstaller>=6.5.0
