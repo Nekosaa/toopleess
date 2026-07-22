@@ -10,12 +10,19 @@ from typing import Callable, Optional
 from core.config import config
 from core.i18n import i18n
 
-LogFn = Callable[[str, str], None]
+# ===== НОВОЕ: Импорт модуля умной подмены =====
+from modules.image_replace import resize_with_mode
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+# ==============================================
 
+LogFn = Callable[[str, str], None]
 
 def _is_windows() -> bool:
     return sys.platform.startswith("win")
-
 
 # ---------------------------------------------------------------------------
 # Layer-type helpers (robust across Photoshop builds / locales)
@@ -39,7 +46,6 @@ def _is_group(layer) -> bool:
     except Exception:
         return True
 
-
 def _is_smart_object(layer) -> bool:
     """LayerKind.SMARTOBJECT = 17 в Photoshop COM."""
     try:
@@ -52,7 +58,6 @@ def _is_smart_object(layer) -> bool:
         return "smart" in str(getattr(layer, "Typename", "")).lower()
     except Exception:
         return False
-
 
 class PhotoshopBridge:
     """Small wrapper around the Photoshop COM interface."""
@@ -118,7 +123,6 @@ class PhotoshopBridge:
         self.available = False
         self._init_error = "Photoshop COM session lost"
 
-
 class PsdToolsFrame(ttk.Frame):
     def __init__(self, master: tk.Misc, log: LogFn) -> None:
         super().__init__(master, padding=(12, 8))
@@ -135,19 +139,30 @@ class PsdToolsFrame(ttk.Frame):
         self._mode_var = tk.StringVar(value=config.get("psd_mode", "fit"))
         self._no_upscale_var = tk.BooleanVar(value=bool(config.get("psd_no_upscale", True)))
         self._clip_bounds_var = tk.BooleanVar(value=bool(config.get("psd_clip_to_bounds", True)))
+        
+        # ===== НОВОЕ: Переменная для наследования метаданных =====
+        self._inherit_meta_var = tk.BooleanVar(value=bool(config.get("psd_inherit_metadata", True)))
+        # =========================================================
+        
         self._in_var = tk.StringVar(value=config.get("psd_in_dir"))
         self._out_var = tk.StringVar(value=config.get("psd_out_dir"))
 
         self._mode_var.trace_add("write",
-            lambda *_: config.set("psd_mode", self._mode_var.get()))
+                                 lambda *_: config.set("psd_mode", self._mode_var.get()))
         self._no_upscale_var.trace_add("write",
-            lambda *_: config.set("psd_no_upscale", bool(self._no_upscale_var.get())))
+                                       lambda *_: config.set("psd_no_upscale", bool(self._no_upscale_var.get())))
         self._clip_bounds_var.trace_add("write",
-            lambda *_: config.set("psd_clip_to_bounds", bool(self._clip_bounds_var.get())))
+                                        lambda *_: config.set("psd_clip_to_bounds", bool(self._clip_bounds_var.get())))
+        
+        # ===== НОВОЕ: Сохранение настройки =====
+        self._inherit_meta_var.trace_add("write",
+                                         lambda *_: config.set("psd_inherit_metadata", bool(self._inherit_meta_var.get())))
+        # =======================================
+        
         self._in_var.trace_add("write",
-            lambda *_: config.set("psd_in_dir", self._in_var.get()))
+                               lambda *_: config.set("psd_in_dir", self._in_var.get()))
         self._out_var.trace_add("write",
-            lambda *_: config.set("psd_out_dir", self._out_var.get()))
+                                lambda *_: config.set("psd_out_dir", self._out_var.get()))
 
         self._build()
         i18n.subscribe(self._retranslate)
@@ -159,10 +174,10 @@ class PsdToolsFrame(ttk.Frame):
         toolbar = ttk.Frame(self)
         toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
 
-        self._btn_open  = ttk.Button(toolbar, text=i18n.t("psd.open"),    command=self.open_psd)
-        self._btn_scan  = ttk.Button(toolbar, text=i18n.t("psd.scan"),    command=self.scan_layers)
-        self._btn_unlck = ttk.Button(toolbar, text=i18n.t("psd.unlock"),  command=self.unlock_all)
-        self._btn_repl  = ttk.Button(toolbar, text=i18n.t("psd.replace"), command=self.replace_in_selected)
+        self._btn_open = ttk.Button(toolbar, text=i18n.t("psd.open"), command=self.open_psd)
+        self._btn_scan = ttk.Button(toolbar, text=i18n.t("psd.scan"), command=self.scan_layers)
+        self._btn_unlck = ttk.Button(toolbar, text=i18n.t("psd.unlock"), command=self.unlock_all)
+        self._btn_repl = ttk.Button(toolbar, text=i18n.t("psd.replace"), command=self.replace_in_selected)
         for i, b in enumerate((self._btn_open, self._btn_scan, self._btn_unlck, self._btn_repl)):
             b.grid(row=0, column=i, padx=(0, 6))
 
@@ -184,13 +199,13 @@ class PsdToolsFrame(ttk.Frame):
         right.columnconfigure(1, weight=1)
 
         self._lbl_actions = ttk.Label(right, text=i18n.t("psd.section.actions"),
-                                      font=("Segoe UI", 10, "bold"))
+                                     font=("Segoe UI", 10, "bold"))
         self._lbl_actions.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
         self._lbl_mode = ttk.Label(right, text=i18n.t("psd.mode"))
         self._lbl_mode.grid(row=1, column=0, sticky="w", pady=4)
-        self._rb_fit  = ttk.Radiobutton(right, text=i18n.t("psd.mode.fit"),
-                                        variable=self._mode_var, value="fit")
+        self._rb_fit = ttk.Radiobutton(right, text=i18n.t("psd.mode.fit"),
+                                       variable=self._mode_var, value="fit")
         self._rb_fill = ttk.Radiobutton(right, text=i18n.t("psd.mode.fill"),
                                         variable=self._mode_var, value="fill")
         self._rb_orig = ttk.Radiobutton(right, text=i18n.t("psd.mode.original"),
@@ -215,31 +230,39 @@ class PsdToolsFrame(ttk.Frame):
         )
         self._cb_clip_bounds.grid(row=4, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
+        # ===== НОВОЕ: Чекбокс "Наследовать настройки" =====
+        self._cb_inherit_meta = ttk.Checkbutton(
+            right, text=i18n.t("psd.inherit.metadata"),
+            variable=self._inherit_meta_var,
+        )
+        self._cb_inherit_meta.grid(row=5, column=0, columnspan=4, sticky="w", pady=(2, 0))
+        # ==================================================
+
         ttk.Separator(right, orient="horizontal").grid(
-            row=5, column=0, columnspan=4, sticky="ew", pady=12,
+            row=6, column=0, columnspan=4, sticky="ew", pady=12,
         )
 
         self._lbl_batch = ttk.Label(right, text=i18n.t("psd.section.batch"),
                                     font=("Segoe UI", 10, "bold"))
-        self._lbl_batch.grid(row=6, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        self._lbl_batch.grid(row=7, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
         self._lbl_in = ttk.Label(right, text=i18n.t("psd.in.folder"))
-        self._lbl_in.grid(row=7, column=0, sticky="w")
-        ttk.Entry(right, textvariable=self._in_var).grid(row=7, column=1, columnspan=2, sticky="ew", padx=6)
+        self._lbl_in.grid(row=8, column=0, sticky="w")
+        ttk.Entry(right, textvariable=self._in_var).grid(row=8, column=1, columnspan=2, sticky="ew", padx=6)
         self._btn_in = ttk.Button(right, text=i18n.t("common.browse"),
                                   command=lambda: self._pick(self._in_var, "psd_in_dir"))
-        self._btn_in.grid(row=7, column=3, sticky="w")
+        self._btn_in.grid(row=8, column=3, sticky="w")
 
         self._lbl_out = ttk.Label(right, text=i18n.t("psd.out.folder"))
-        self._lbl_out.grid(row=8, column=0, sticky="w", pady=4)
-        ttk.Entry(right, textvariable=self._out_var).grid(row=8, column=1, columnspan=2, sticky="ew", padx=6, pady=4)
+        self._lbl_out.grid(row=9, column=0, sticky="w", pady=4)
+        ttk.Entry(right, textvariable=self._out_var).grid(row=9, column=1, columnspan=2, sticky="ew", padx=6, pady=4)
         self._btn_out = ttk.Button(right, text=i18n.t("common.browse"),
                                    command=lambda: self._pick(self._out_var, "psd_out_dir"))
-        self._btn_out.grid(row=8, column=3, sticky="w", pady=4)
+        self._btn_out.grid(row=9, column=3, sticky="w", pady=4)
 
         self._btn_batch = ttk.Button(right, text=i18n.t("psd.batch"),
                                      command=self.batch_replace)
-        self._btn_batch.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        self._btn_batch.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(12, 0))
 
         self._warn = ttk.Label(self, text="", foreground="#c05555")
         self._warn.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
@@ -268,7 +291,7 @@ class PsdToolsFrame(ttk.Frame):
 
         if self._ps is None or not self._ps.available:
             err = self._ps.error() if self._ps is not None else "no bridge"
-            self._warn.configure(text=f"{i18n.t('psd.no.photoshop')}  ({err})")
+            self._warn.configure(text=f"{i18n.t('psd.no.photoshop')} ({err})")
             self._log(i18n.t("psd.no.photoshop"), "error")
             return False
 
@@ -332,13 +355,13 @@ class PsdToolsFrame(ttk.Frame):
         msg = (str(last_exc) or last_exc.__class__.__name__) if last_exc else "unknown"
         hint = (
             "\n\nВозможные причины:\n"
-            "  • Photoshop закрыт или ещё не готов — откройте его вручную и повторите\n"
-            "  • В Photoshop открыт модальный диалог (Missing Fonts, Camera Raw и т.п.) — закройте его\n"
-            "  • Файл сейчас открыт/заблокирован (OneDrive/Dropbox sync)\n"
-            "  • Путь содержит символы, которых Photoshop не понимает —\n"
-            "    попробуйте короткий латинский путь (например C:\\test\\file.psd)\n"
-            "  • Photoshop показывает «Missing Fonts / Color Profile» — сначала\n"
-            "    откройте файл вручную и ответьте на его вопросы"
+            " • Photoshop закрыт или ещё не готов — откройте его вручную и повторите\n"
+            " • В Photoshop открыт модальный диалог (Missing Fonts, Camera Raw и т.п.) — закройте его\n"
+            " • Файл сейчас открыт/заблокирован (OneDrive/Dropbox sync)\n"
+            " • Путь содержит символы, которых Photoshop не понимает —\n"
+            "   попробуйте короткий латинский путь (например C:\\test\\file.psd)\n"
+            " • Photoshop показывает «Missing Fonts / Color Profile» — сначала\n"
+            "   откройте файл вручную и ответьте на его вопросы"
         )
         messagebox.showerror(i18n.t("error.title"), f"{msg}{hint}")
         self._log(msg, "error")
@@ -395,16 +418,16 @@ class PsdToolsFrame(ttk.Frame):
 
             marker = ""
             if is_group:
-                marker = "  [G]"
+                marker = " [G]"
             elif is_so:
-                marker = "  [SO]"
+                marker = " [SO]"
             else:
                 try:
                     b = layer.Bounds
                     w = float(b[2]) - float(b[0])
                     h = float(b[3]) - float(b[1])
                     if w <= 0 or h <= 0:
-                        marker = "  [empty]"
+                        marker = " [empty]"
                 except Exception:
                     pass
 
@@ -462,7 +485,7 @@ class PsdToolsFrame(ttk.Frame):
         try:
             layer = self._resolve_layer(path)
             self._replace_layer_content(layer, image_path, self._mode_var.get(),
-                                        frame_key=json.dumps(path))
+                                       frame_key=json.dumps(path))
             self._log(f"Replaced photo in '{name}'", "ok")
         except Exception as exc:
             messagebox.showerror(i18n.t("error.title"), str(exc))
@@ -482,6 +505,83 @@ class PsdToolsFrame(ttk.Frame):
             else:
                 node = node.Layers.Item(step)
         return node
+
+    # ===== НОВЫЙ МЕТОД: Умная подготовка изображения =====
+    def _prepare_image_for_psd(
+        self,
+        new_image_path: str,
+        target_width: int,
+        target_height: int,
+        mode: str
+    ) -> str:
+        """
+        Подготовить изображение перед вставкой в PSD.
+        Применяет умную подгонку размеров с учётом настроек.
+        
+        Returns:
+            Путь к подготовленному изображению (временный файл)
+        """
+        if not PIL_AVAILABLE:
+            self._log("Pillow недоступен, пропускаем подготовку", "warn")
+            return new_image_path
+        
+        inherit_metadata = self._inherit_meta_var.get()
+        no_upscale = self._no_upscale_var.get()
+        
+        try:
+            # Открываем новое изображение
+            with Image.open(new_image_path) as new_img:
+                
+                # Если режим "original" - не трогаем размер
+                if mode == "original":
+                    result_img = new_img.copy()
+                else:
+                    # Используем умную подгонку
+                    target_size = (target_width, target_height)
+                    
+                    # Маппинг режимов
+                    resize_mode_map = {
+                        "fit": "fit",
+                        "fill": "fill"
+                    }
+                    resize_mode = resize_mode_map.get(mode, "fit")
+                    
+                    result_img = resize_with_mode(
+                        new_img,
+                        target_size,
+                        resize_mode,
+                        no_upscale=no_upscale
+                    )
+                
+                # Конвертируем в RGB для совместимости с PSD
+                if result_img.mode not in ("RGB", "RGBA"):
+                    result_img = result_img.convert("RGB")
+                
+                # Создаём временный файл
+                temp_dir = Path(new_image_path).parent / ".prizma_temp"
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                
+                temp_file = temp_dir / f"prepared_{Path(new_image_path).name}"
+                if temp_file.suffix.lower() not in ('.png', '.jpg', '.jpeg'):
+                    temp_file = temp_file.with_suffix('.png')
+                
+                # Сохраняем
+                save_kwargs = {"format": "PNG", "optimize": False}
+                result_img.save(temp_file, **save_kwargs)
+                
+                if inherit_metadata:
+                    self._log(
+                        f"Изображение подготовлено: {target_width}x{target_height}px, "
+                        f"режим={mode}, no_upscale={no_upscale}",
+                        "info"
+                    )
+                
+                return str(temp_file)
+                
+        except Exception as e:
+            self._log(f"Ошибка подготовки: {e}", "warn")
+            return new_image_path
+    # ======================================================
 
     def _replace_smart_object(self, so_layer, image_path: str, mode: str,
                               frame_key: Optional[str] = None) -> None:
@@ -504,75 +604,75 @@ class PsdToolsFrame(ttk.Frame):
         no_upscale_literal = "true" if bool(config.get("psd_no_upscale", True)) else "false"
 
         jsx = r"""
-        (function () {
-            var NEW_PATH   = __PATH__;
-            var MODE       = __MODE__;
-            var NO_UPSCALE = __NO_UPSCALE__;
-            var FRAME      = "__FRAME__";
+(function () {
+    var NEW_PATH = __PATH__;
+    var MODE = __MODE__;
+    var NO_UPSCALE = __NO_UPSCALE__;
+    var FRAME = "__FRAME__";
 
-            var doc = app.activeDocument;
-            var so  = doc.activeLayer;
+    var doc = app.activeDocument;
+    var so = doc.activeLayer;
 
-            var savedRulerUnits = app.preferences.rulerUnits;
-            var savedTypeUnits  = app.preferences.typeUnits;
-            app.preferences.rulerUnits = Units.PIXELS;
-            app.preferences.typeUnits  = TypeUnits.PIXELS;
+    var savedRulerUnits = app.preferences.rulerUnits;
+    var savedTypeUnits = app.preferences.typeUnits;
+    app.preferences.rulerUnits = Units.PIXELS;
+    app.preferences.typeUnits = TypeUnits.PIXELS;
 
-            function asPx(v){ try { return v.as('px'); } catch(e){ return Number(v); } }
+    function asPx(v){ try { return v.as('px'); } catch(e){ return Number(v); } }
 
-            // Целевая рамка: из Python (эталон прошлых замен) либо bounds SO
-            // ДО замены (первый раз).
-            var FL, FT, FR, FB;
-            if (FRAME === "AUTO") {
-                var ob = so.bounds;
-                FL = asPx(ob[0]); FT = asPx(ob[1]);
-                FR = asPx(ob[2]); FB = asPx(ob[3]);
+    // Целевая рамка: из Python (эталон прошлых замен) либо bounds SO
+    // ДО замены (первый раз).
+    var FL, FT, FR, FB;
+    if (FRAME === "AUTO") {
+        var ob = so.bounds;
+        FL = asPx(ob[0]); FT = asPx(ob[1]);
+        FR = asPx(ob[2]); FB = asPx(ob[3]);
+    } else {
+        var parts = FRAME.split(",");
+        FL = parseFloat(parts[0]); FT = parseFloat(parts[1]);
+        FR = parseFloat(parts[2]); FB = parseFloat(parts[3]);
+    }
+    var FW = FR - FL, FH = FB - FT;
+
+    // Штатная замена содержимого смарт-объекта.
+    var d = new ActionDescriptor();
+    d.putPath(charIDToTypeID('null'), new File(NEW_PATH));
+    try { d.putInteger(charIDToTypeID('PgNm'), 1); } catch(e) {}
+    executeAction(stringIDToTypeID('placedLayerReplaceContents'),
+                  d, DialogModes.NO);
+
+    so = doc.activeLayer;
+
+    // Подгон масштаба SO-слоя под рамку (fit/fill).
+    if (MODE !== 'original' && FW > 0 && FH > 0) {
+        var b = so.bounds;
+        var w = asPx(b[2]) - asPx(b[0]);
+        var h = asPx(b[3]) - asPx(b[1]);
+        if (w > 0 && h > 0) {
+            var scale;
+            if (MODE === 'fill') {
+                scale = Math.max(FW / w, FH / h);
             } else {
-                var parts = FRAME.split(",");
-                FL = parseFloat(parts[0]); FT = parseFloat(parts[1]);
-                FR = parseFloat(parts[2]); FB = parseFloat(parts[3]);
+                scale = Math.min(FW / w, FH / h);
             }
-            var FW = FR - FL, FH = FB - FT;
+            if (NO_UPSCALE && scale > 1.0) scale = 1.0;
+            so.resize(scale * 100.0, scale * 100.0,
+                     AnchorPosition.MIDDLECENTER);
+        }
+    }
 
-            // Штатная замена содержимого смарт-объекта.
-            var d = new ActionDescriptor();
-            d.putPath(charIDToTypeID('null'), new File(NEW_PATH));
-            try { d.putInteger(charIDToTypeID('PgNm'), 1); } catch(e) {}
-            executeAction(stringIDToTypeID('placedLayerReplaceContents'),
-                          d, DialogModes.NO);
+    // Центрируем по рамке.
+    var nb = so.bounds;
+    var cx = (asPx(nb[0]) + asPx(nb[2])) / 2;
+    var cy = (asPx(nb[1]) + asPx(nb[3])) / 2;
+    so.translate((FL + FR) / 2 - cx, (FT + FB) / 2 - cy);
 
-            so = doc.activeLayer;
+    app.preferences.rulerUnits = savedRulerUnits;
+    app.preferences.typeUnits = savedTypeUnits;
 
-            // Подгон масштаба SO-слоя под рамку (fit/fill).
-            if (MODE !== 'original' && FW > 0 && FH > 0) {
-                var b = so.bounds;
-                var w = asPx(b[2]) - asPx(b[0]);
-                var h = asPx(b[3]) - asPx(b[1]);
-                if (w > 0 && h > 0) {
-                    var scale;
-                    if (MODE === 'fill') {
-                        scale = Math.max(FW / w, FH / h);
-                    } else {
-                        scale = Math.min(FW / w, FH / h);
-                    }
-                    if (NO_UPSCALE && scale > 1.0) scale = 1.0;
-                    so.resize(scale * 100.0, scale * 100.0,
-                              AnchorPosition.MIDDLECENTER);
-                }
-            }
-
-            // Центрируем по рамке.
-            var nb = so.bounds;
-            var cx = (asPx(nb[0]) + asPx(nb[2])) / 2;
-            var cy = (asPx(nb[1]) + asPx(nb[3])) / 2;
-            so.translate((FL + FR) / 2 - cx, (FT + FB) / 2 - cy);
-
-            app.preferences.rulerUnits = savedRulerUnits;
-            app.preferences.typeUnits  = savedTypeUnits;
-
-            return FL + "|" + FT + "|" + FR + "|" + FB;
-        })();
-        """
+    return FL + "|" + FT + "|" + FR + "|" + FB;
+})();
+"""
         jsx = (jsx
                .replace("__PATH__", path_literal)
                .replace("__MODE__", mode_literal)
@@ -596,55 +696,55 @@ class PsdToolsFrame(ttk.Frame):
 
     def _activate_target_raster_in_active_doc(self) -> None:
         jsx = r"""
-        (function () {
-            var doc = app.activeDocument;
+(function () {
+    var doc = app.activeDocument;
 
-            function asPx(v){ try { return v.as('px'); } catch(e){ return Number(v); } }
-            function area(L) {
-                try {
-                    var b = L.bounds;
-                    var w = asPx(b[2]) - asPx(b[0]);
-                    var h = asPx(b[3]) - asPx(b[1]);
-                    if (w <= 0 || h <= 0) return 0;
-                    return w * h;
-                } catch (e) { return 0; }
-            }
-            function isSO(L) {
-                try { return L.kind === LayerKind.SMARTOBJECT; } catch(e){ return false; }
-            }
+    function asPx(v){ try { return v.as('px'); } catch(e){ return Number(v); } }
+    function area(L) {
+        try {
+            var b = L.bounds;
+            var w = asPx(b[2]) - asPx(b[0]);
+            var h = asPx(b[3]) - asPx(b[1]);
+            if (w <= 0 || h <= 0) return 0;
+            return w * h;
+        } catch (e) { return 0; }
+    }
+    function isSO(L) {
+        try { return L.kind === LayerKind.SMARTOBJECT; } catch(e){ return false; }
+    }
 
-            var best = null;
-            var bestArea = -1;
-            function walkBiggest(container) {
-                for (var i = 0; i < container.artLayers.length; i++) {
-                    var L = container.artLayers[i];
-                    if (isSO(L)) continue;
-                    var a = area(L);
-                    if (a > bestArea) { bestArea = a; best = L; }
-                }
-                for (var g = 0; g < container.layerSets.length; g++) {
-                    walkBiggest(container.layerSets[g]);
-                }
-            }
-            walkBiggest(doc);
+    var best = null;
+    var bestArea = -1;
+    function walkBiggest(container) {
+        for (var i = 0; i < container.artLayers.length; i++) {
+            var L = container.artLayers[i];
+            if (isSO(L)) continue;
+            var a = area(L);
+            if (a > bestArea) { bestArea = a; best = L; }
+        }
+        for (var g = 0; g < container.layerSets.length; g++) {
+            walkBiggest(container.layerSets[g]);
+        }
+    }
+    walkBiggest(doc);
 
-            function pickAny(container) {
-                for (var i = 0; i < container.artLayers.length; i++) {
-                    var L = container.artLayers[i];
-                    if (!isSO(L)) return L;
-                }
-                for (var g = 0; g < container.layerSets.length; g++) {
-                    var f = pickAny(container.layerSets[g]);
-                    if (f) return f;
-                }
-                if (container.artLayers.length > 0) return container.artLayers[0];
-                return null;
-            }
+    function pickAny(container) {
+        for (var i = 0; i < container.artLayers.length; i++) {
+            var L = container.artLayers[i];
+            if (!isSO(L)) return L;
+        }
+        for (var g = 0; g < container.layerSets.length; g++) {
+            var f = pickAny(container.layerSets[g]);
+            if (f) return f;
+        }
+        if (container.artLayers.length > 0) return container.artLayers[0];
+        return null;
+    }
 
-            var target = best || pickAny(doc);
-            if (target) doc.activeLayer = target;
-        })();
-        """
+    var target = best || pickAny(doc);
+    if (target) doc.activeLayer = target;
+})();
+"""
         self._ps.app.DoJavaScript(jsx)
 
     def _replace_layer_content(self, layer, image_path: str, mode: str,
@@ -658,6 +758,26 @@ class PsdToolsFrame(ttk.Frame):
             self._replace_raster_merge_down(layer, image_path, mode)
 
     def _replace_raster_merge_down(self, layer, image_path: str, mode: str) -> None:
+        # ===== НОВОЕ: Подготовка изображения перед вставкой =====
+        try:
+            # Получаем размеры целевого слоя
+            bounds = layer.Bounds
+            target_width = int(bounds[2] - bounds[0])
+            target_height = int(bounds[3] - bounds[1])
+            
+            # Если включено наследование - подготавливаем изображение
+            if self._inherit_meta_var.get() and target_width > 0 and target_height > 0:
+                prepared_path = self._prepare_image_for_psd(
+                    image_path,
+                    target_width,
+                    target_height,
+                    mode
+                )
+                image_path = prepared_path
+        except Exception as e:
+            self._log(f"Не удалось подготовить изображение: {e}", "warn")
+        # =========================================================
+        
         self._doc.ActiveLayer = layer
         self._run_merge_down_jsx(image_path, mode)
 
@@ -668,131 +788,131 @@ class PsdToolsFrame(ttk.Frame):
         clip_literal = "true" if bool(config.get("psd_clip_to_bounds", True)) else "false"
 
         jsx = r"""
-        (function () {
-            var NEW_PATH   = __PATH__;
-            var MODE       = __MODE__;
-            var NO_UPSCALE = __NO_UPSCALE__;
-            var CLIP       = __CLIP__;
+(function () {
+    var NEW_PATH = __PATH__;
+    var MODE = __MODE__;
+    var NO_UPSCALE = __NO_UPSCALE__;
+    var CLIP = __CLIP__;
 
-            var doc = app.activeDocument;
-            var target = doc.activeLayer;
+    var doc = app.activeDocument;
+    var target = doc.activeLayer;
 
-            var targetName = target.name;
+    var targetName = target.name;
 
-            var savedRulerUnits = app.preferences.rulerUnits;
-            var savedTypeUnits  = app.preferences.typeUnits;
-            app.preferences.rulerUnits = Units.PIXELS;
-            app.preferences.typeUnits  = TypeUnits.PIXELS;
+    var savedRulerUnits = app.preferences.rulerUnits;
+    var savedTypeUnits = app.preferences.typeUnits;
+    app.preferences.rulerUnits = Units.PIXELS;
+    app.preferences.typeUnits = TypeUnits.PIXELS;
 
-            function asPx(v){ try { return v.as('px'); } catch(e){ return Number(v); } }
+    function asPx(v){ try { return v.as('px'); } catch(e){ return Number(v); } }
 
-            var b = target.bounds;
-            var L = asPx(b[0]), T = asPx(b[1]), R = asPx(b[2]), Bt = asPx(b[3]);
-            var W = R - L, H = Bt - T;
+    var b = target.bounds;
+    var L = asPx(b[0]), T = asPx(b[1]), R = asPx(b[2]), Bt = asPx(b[3]);
+    var W = R - L, H = Bt - T;
 
-            var diagW = W, diagH = H;
-            var usedCanvas = false;
+    var diagW = W, diagH = H;
+    var usedCanvas = false;
 
-            if (W <= 0 || H <= 0) {
-                L  = 0;
-                T  = 0;
-                R  = asPx(doc.width);
-                Bt = asPx(doc.height);
-                W  = R - L;
-                H  = Bt - T;
-                usedCanvas = true;
-            }
+    if (W <= 0 || H <= 0) {
+        L = 0;
+        T = 0;
+        R = asPx(doc.width);
+        Bt = asPx(doc.height);
+        W = R - L;
+        H = Bt - T;
+        usedCanvas = true;
+    }
 
-            var effectiveMode = MODE;
-            if (usedCanvas && MODE === 'fit') { effectiveMode = 'fill'; }
-            if (W <= 0 || H <= 0) {
-                app.preferences.rulerUnits = savedRulerUnits;
-                app.preferences.typeUnits  = savedTypeUnits;
-                throw new Error("Both target layer and document have empty bounds.");
-            }
+    var effectiveMode = MODE;
+    if (usedCanvas && MODE === 'fit') { effectiveMode = 'fill'; }
+    if (W <= 0 || H <= 0) {
+        app.preferences.rulerUnits = savedRulerUnits;
+        app.preferences.typeUnits = savedTypeUnits;
+        throw new Error("Both target layer and document have empty bounds.");
+    }
 
-            try { target.allLocked                = false; } catch(e) {}
-            try { target.pixelsLocked             = false; } catch(e) {}
-            try { target.positionLocked           = false; } catch(e) {}
-            try { target.transparentPixelsLocked  = false; } catch(e) {}
+    try { target.allLocked = false; } catch(e) {}
+    try { target.pixelsLocked = false; } catch(e) {}
+    try { target.positionLocked = false; } catch(e) {}
+    try { target.transparentPixelsLocked = false; } catch(e) {}
 
-            doc.activeLayer = target;
-            doc.selection.select([[L,T],[R,T],[R,Bt],[L,Bt]], SelectionType.REPLACE);
+    doc.activeLayer = target;
+    doc.selection.select([[L,T],[R,T],[R,Bt],[L,Bt]], SelectionType.REPLACE);
+    try { doc.selection.clear(); } catch(e) {}
+    try { doc.selection.deselect(); } catch(e) {}
+
+    var f = new File(NEW_PATH);
+    var d = new ActionDescriptor();
+    d.putPath(charIDToTypeID('null'), f);
+    d.putEnumerated(charIDToTypeID('FTcs'), charIDToTypeID('QCSt'), charIDToTypeID('Qcsa'));
+    executeAction(charIDToTypeID('Plc '), d, DialogModes.NO);
+    var placed = doc.activeLayer;
+
+    var pb = placed.bounds;
+    var pw = asPx(pb[2]) - asPx(pb[0]);
+    var ph = asPx(pb[3]) - asPx(pb[1]);
+
+    if (pw > 0 && ph > 0 && effectiveMode !== 'original') {
+        var scale;
+        if (effectiveMode === 'fill') {
+            scale = Math.max(W / pw, H / ph);
+        } else {
+            scale = Math.min(W / pw, H / ph);
+        }
+        if (NO_UPSCALE && !usedCanvas && scale > 1.0) scale = 1.0;
+        var pct = scale * 100.0;
+        placed.resize(pct, pct, AnchorPosition.MIDDLECENTER);
+    }
+
+    pb = placed.bounds;
+    var cx = (asPx(pb[0]) + asPx(pb[2])) / 2;
+    var cy = (asPx(pb[1]) + asPx(pb[3])) / 2;
+    var tcx = (L + R) / 2;
+    var tcy = (T + Bt) / 2;
+    placed.translate(tcx - cx, tcy - cy);
+
+    try { placed.rasterize(RasterizeType.ENTIRELAYER); } catch(e) {}
+
+    if (CLIP) {
+        try {
+            doc.selection.select(
+                [[L,T],[R,T],[R,Bt],[L,Bt]],
+                SelectionType.REPLACE
+            );
+            doc.selection.invert();
+            doc.activeLayer = placed;
             try { doc.selection.clear(); } catch(e) {}
             try { doc.selection.deselect(); } catch(e) {}
+        } catch(e) {}
+    }
 
-            var f = new File(NEW_PATH);
-            var d = new ActionDescriptor();
-            d.putPath(charIDToTypeID('null'), f);
-            d.putEnumerated(charIDToTypeID('FTcs'), charIDToTypeID('QCSt'), charIDToTypeID('Qcsa'));
-            executeAction(charIDToTypeID('Plc '), d, DialogModes.NO);
-            var placed = doc.activeLayer;
+    var mergeStatus = "MERGED";
+    try {
+        placed.merge();
+    } catch (mergeErr) {
+        mergeStatus = "FALLBACK";
+        try {
+            doc.activeLayer = target;
+            try { target.isBackgroundLayer = false; } catch(e) {}
+            try { target.allLocked = false; } catch(e) {}
+            try { target.pixelsLocked = false; } catch(e) {}
+            try { target.positionLocked = false; } catch(e) {}
+            try { target.transparentPixelsLocked = false; } catch(e) {}
+            target.remove();
+        } catch (rmErr) {}
+        try { doc.activeLayer = placed; } catch(e) {}
+    }
 
-            var pb = placed.bounds;
-            var pw = asPx(pb[2]) - asPx(pb[0]);
-            var ph = asPx(pb[3]) - asPx(pb[1]);
+    try { doc.activeLayer.name = targetName; } catch(e) {}
 
-            if (pw > 0 && ph > 0 && effectiveMode !== 'original') {
-                var scale;
-                if (effectiveMode === 'fill') {
-                    scale = Math.max(W / pw, H / ph);
-                } else {
-                    scale = Math.min(W / pw, H / ph);
-                }
-                if (NO_UPSCALE && !usedCanvas && scale > 1.0) scale = 1.0;
-                var pct = scale * 100.0;
-                placed.resize(pct, pct, AnchorPosition.MIDDLECENTER);
-            }
+    app.preferences.rulerUnits = savedRulerUnits;
+    app.preferences.typeUnits = savedTypeUnits;
 
-            pb = placed.bounds;
-            var cx = (asPx(pb[0]) + asPx(pb[2])) / 2;
-            var cy = (asPx(pb[1]) + asPx(pb[3])) / 2;
-            var tcx = (L + R) / 2;
-            var tcy = (T + Bt) / 2;
-            placed.translate(tcx - cx, tcy - cy);
-
-            try { placed.rasterize(RasterizeType.ENTIRELAYER); } catch(e) {}
-
-            if (CLIP) {
-                try {
-                    doc.selection.select(
-                        [[L,T],[R,T],[R,Bt],[L,Bt]],
-                        SelectionType.REPLACE
-                    );
-                    doc.selection.invert();
-                    doc.activeLayer = placed;
-                    try { doc.selection.clear(); } catch(e) {}
-                    try { doc.selection.deselect(); } catch(e) {}
-                } catch(e) {}
-            }
-
-            var mergeStatus = "MERGED";
-            try {
-                placed.merge();
-            } catch (mergeErr) {
-                mergeStatus = "FALLBACK";
-                try {
-                    doc.activeLayer = target;
-                    try { target.isBackgroundLayer = false; } catch(e) {}
-                    try { target.allLocked               = false; } catch(e) {}
-                    try { target.pixelsLocked            = false; } catch(e) {}
-                    try { target.positionLocked          = false; } catch(e) {}
-                    try { target.transparentPixelsLocked = false; } catch(e) {}
-                    target.remove();
-                } catch (rmErr) {}
-                try { doc.activeLayer = placed; } catch(e) {}
-            }
-
-            try { doc.activeLayer.name = targetName; } catch(e) {}
-
-            app.preferences.rulerUnits = savedRulerUnits;
-            app.preferences.typeUnits  = savedTypeUnits;
-
-            return mergeStatus + "|" + diagW + "|" + diagH
-                 + "|" + (usedCanvas ? "1" : "0")
-                 + "|" + effectiveMode;
-        })();
-        """
+    return mergeStatus + "|" + diagW + "|" + diagH
+           + "|" + (usedCanvas ? "1" : "0")
+           + "|" + effectiveMode;
+})();
+"""
         jsx = (jsx
                .replace("__PATH__", path_literal)
                .replace("__MODE__", mode_literal)
@@ -821,13 +941,13 @@ class PsdToolsFrame(ttk.Frame):
                 "маркером [SO]",
                 "warn",
             )
-            if effective_mode != mode:
-                self._log(
-                    f"mode '{mode}' → '{effective_mode}' (auto): при "
-                    "canvas-fallback режим Fit оставляет полосы старого фото "
-                    "по краям, поэтому placed растянут по длинной стороне",
-                    "warn",
-                )
+        if effective_mode != mode:
+            self._log(
+                f"mode '{mode}' → '{effective_mode}' (auto): при "
+                "canvas-fallback режим Fit оставляет полосы старого фото "
+                "по краям, поэтому placed растянут по длинной стороне",
+                "warn",
+            )
             try:
                 self._warn.configure(
                     text="⚠ Выбран пустой слой (0×0). Использован canvas-"
@@ -878,7 +998,7 @@ class PsdToolsFrame(ttk.Frame):
             try:
                 layer = self._resolve_layer(path)
                 self._replace_layer_content(layer, str(img), self._mode_var.get(),
-                                            frame_key=frame_key)
+                                           frame_key=frame_key)
                 target = out_dir / f"{self._psd_path.stem}__{img.stem}.psd"
                 self._doc.SaveAs(str(target))
                 self._log(f"Saved: {target.name}", "ok")
@@ -888,18 +1008,21 @@ class PsdToolsFrame(ttk.Frame):
 
     def _retranslate(self) -> None:
         pairs = [
-            (self._btn_open,  "psd.open"),
-            (self._btn_scan,  "psd.scan"),
+            (self._btn_open, "psd.open"),
+            (self._btn_scan, "psd.scan"),
             (self._btn_unlck, "psd.unlock"),
-            (self._btn_repl,  "psd.replace"),
+            (self._btn_repl, "psd.replace"),
             (self._btn_batch, "psd.batch"),
-            (self._btn_in,    "common.browse"),
-            (self._btn_out,   "common.browse"),
-            (self._rb_fit,    "psd.mode.fit"),
-            (self._rb_fill,   "psd.mode.fill"),
-            (self._rb_orig,   "psd.mode.original"),
-            (self._cb_no_upscale,  "psd.no.upscale"),
+            (self._btn_in, "common.browse"),
+            (self._btn_out, "common.browse"),
+            (self._rb_fit, "psd.mode.fit"),
+            (self._rb_fill, "psd.mode.fill"),
+            (self._rb_orig, "psd.mode.original"),
+            (self._cb_no_upscale, "psd.no.upscale"),
             (self._cb_clip_bounds, "psd.clip.bounds"),
+            # ===== НОВОЕ =====
+            (self._cb_inherit_meta, "psd.inherit.metadata"),
+            # =================
         ]
         for widget, key in pairs:
             widget.configure(text=i18n.t(key))
@@ -911,4 +1034,4 @@ class PsdToolsFrame(ttk.Frame):
         self._lbl_in.configure(text=i18n.t("psd.in.folder"))
         self._lbl_out.configure(text=i18n.t("psd.out.folder"))
         if self._ps and not self._ps.available:
-            self._warn.configure(text=f"{i18n.t('psd.no.photoshop')}  ({self._ps.error()})")
+            self._warn.configure(text=f"{i18n.t('psd.no.photoshop')} ({self._ps.error()})")
