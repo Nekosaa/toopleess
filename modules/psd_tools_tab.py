@@ -21,10 +21,6 @@ def _is_windows() -> bool:
 # Layer-type helpers (robust across Photoshop builds / locales)
 # ---------------------------------------------------------------------------
 def _is_group(layer) -> bool:
-    """LayerSet detection: только у групп есть .ArtLayers / .LayerSets
-    подколлекции. У ArtLayer обращение к ним бросает исключение.
-    Проверяем несколько атрибутов подряд — разные сборки PS выставляют
-    их по-разному."""
     for attr in ("LayerSets", "ArtLayers", "Layers"):
         try:
             _ = getattr(layer, attr).Count
@@ -37,8 +33,6 @@ def _is_group(layer) -> bool:
             return True
     except Exception:
         pass
-    # Финальный сигнал: у LayerSet нет .Kind (обращение падает),
-    # а у ArtLayer .Kind всегда возвращает int.
     try:
         _ = int(getattr(layer, "Kind"))
         return False
@@ -133,6 +127,10 @@ class PsdToolsFrame(ttk.Frame):
         self._doc = None
         self._psd_path: Optional[Path] = None
         self._layers_index: list[tuple[str, list]] = []
+        # Запоминаем ИСХОДНУЮ рамку каждого смарт-объекта (bounds до первой
+        # замены), чтобы 2-я и последующие замены подгонялись под тот же
+        # кадр, а не под уменьшенный размер предыдущего фото.
+        self._so_frames: dict[str, tuple] = {}
 
         self._mode_var = tk.StringVar(value=config.get("psd_mode", "fit"))
         self._no_upscale_var = tk.BooleanVar(value=bool(config.get("psd_no_upscale", True)))
@@ -351,15 +349,12 @@ class PsdToolsFrame(ttk.Frame):
             return
         self._layers_index.clear()
         self._listbox.delete(0, "end")
+        self._so_frames.clear()
         max_depth = int(config.get("smart_object_depth", 3))
         self._walk(self._doc, path=[], depth=0, max_depth=max_depth)
         self._log(f"Layers scanned: {len(self._layers_index)}", "info")
 
     def _enumerate_children(self, container) -> list:
-        """Возвращает список (layer, ('L'|'A'|'S', idx)) для детей контейнера.
-        Пробуем сначала .Layers (даёт исходный порядок как в панели PS).
-        Если .Layers пустая или недоступна — берём .ArtLayers + .LayerSets
-        по отдельности (для сборок PS, где .Layers на LayerSet не работает)."""
         out: list = []
         try:
             n = int(container.Layers.Count)
@@ -372,7 +367,6 @@ class PsdToolsFrame(ttk.Frame):
                 except Exception:
                     continue
             return out
-        # Fallback: собираем детей отдельно
         try:
             for i in range(1, int(container.ArtLayers.Count) + 1):
                 try:
@@ -405,10 +399,6 @@ class PsdToolsFrame(ttk.Frame):
             elif is_so:
                 marker = "  [SO]"
             else:
-                # Маркер [empty] для обычных растровых слоёв с пустыми
-                # bounds (0×0). Клик по такому слою в Replace → canvas-
-                # fallback, а не аккуратная замена внутри рамки. Помечаем
-                # заранее, чтобы пользователь видел это ещё до Replace.
                 try:
                     b = layer.Bounds
                     w = float(b[2]) - float(b[0])
@@ -471,16 +461,14 @@ class PsdToolsFrame(ttk.Frame):
             return
         try:
             layer = self._resolve_layer(path)
-            self._replace_layer_content(layer, image_path, self._mode_var.get())
+            self._replace_layer_content(layer, image_path, self._mode_var.get(),
+                                        frame_key=json.dumps(path))
             self._log(f"Replaced photo in '{name}'", "ok")
         except Exception as exc:
             messagebox.showerror(i18n.t("error.title"), str(exc))
             self._log(str(exc), "error")
 
     def _resolve_layer(self, path: list):
-        """path — список либо int (старый формат), либо кортежей
-        ('L'|'A'|'S', idx) — новый формат для сборок PS, где .Layers
-        на LayerSet может не работать."""
         node = self._doc
         for step in path:
             if isinstance(step, tuple):
@@ -495,31 +483,22 @@ class PsdToolsFrame(ttk.Frame):
                 node = node.Layers.Item(step)
         return node
 
-    def _replace_smart_object(self, so_layer, image_path: str, mode: str) -> None:
+    def _replace_smart_object(self, so_layer, image_path: str, mode: str,
+                              frame_key: Optional[str] = None) -> None:
+        """Замена содержимого смарт-объекта штатным `placedLayerReplaceContents`,
+        затем подгон SO-слоя под его ИСХОДНУЮ рамку (запоминается в
+        self._so_frames — чтобы повторные замены давали тот же кадр)."""
         self._doc.ActiveLayer = so_layer
 
-        js_open = (
-            'try{executeAction(stringIDToTypeID("placedLayerEditContents"),'
-            ' undefined, DialogModes.NO);}catch(e){}'
-        )
-        self._ps.app.DoJavaScript(js_open)
+        stored = self._so_frames.get(frame_key) if frame_key else None
+        frame_literal = ",".join(f"{v:.3f}" for v in stored) if stored else "AUTO"
 
-        so_doc = self._ps.app.ActiveDocument
-        try:
-            self._run_so_canvas_replace_jsx(image_path, mode)
-            so_doc.Save()
-        finally:
-            so_doc.Close(2)
+        returned = self._run_so_replace_contents_jsx(image_path, mode, frame_literal)
+        if frame_key and returned:
+            self._so_frames[frame_key] = returned
 
-    def _run_so_canvas_replace_jsx(self, image_path: str, mode: str) -> None:
-        """Чистая, повторяемая замена содержимого смарт-объекта.
-
-        Вписываем новое фото в КАНВАС смарт-объекта (фиксированный размер,
-        который никогда не «сжимается»), после чего сводим документ. Благодаря
-        этому вторая и последующие замены дают тот же кадр, что и первая —
-        раньше фото вписывалось в bounds внутреннего слоя, которые после
-        merge-down уменьшались до размера прошлого фото, и картинка с каждым
-        разом мельчала / уезжала."""
+    def _run_so_replace_contents_jsx(self, image_path: str, mode: str,
+                                     frame_literal: str):
         path_literal = json.dumps(str(Path(image_path)))
         mode_literal = json.dumps(mode)
         no_upscale_literal = "true" if bool(config.get("psd_no_upscale", True)) else "false"
@@ -529,8 +508,10 @@ class PsdToolsFrame(ttk.Frame):
             var NEW_PATH   = __PATH__;
             var MODE       = __MODE__;
             var NO_UPSCALE = __NO_UPSCALE__;
+            var FRAME      = "__FRAME__";
 
             var doc = app.activeDocument;
+            var so  = doc.activeLayer;
 
             var savedRulerUnits = app.preferences.rulerUnits;
             var savedTypeUnits  = app.preferences.typeUnits;
@@ -539,63 +520,79 @@ class PsdToolsFrame(ttk.Frame):
 
             function asPx(v){ try { return v.as('px'); } catch(e){ return Number(v); } }
 
-            // Рамка = весь канвас смарт-объекта (не bounds внутреннего слоя).
-            var L = 0, T = 0;
-            var R  = asPx(doc.width);
-            var Bt = asPx(doc.height);
-            var W = R - L, H = Bt - T;
+            // Целевая рамка: из Python (эталон прошлых замен) либо bounds SO
+            // ДО замены (первый раз).
+            var FL, FT, FR, FB;
+            if (FRAME === "AUTO") {
+                var ob = so.bounds;
+                FL = asPx(ob[0]); FT = asPx(ob[1]);
+                FR = asPx(ob[2]); FB = asPx(ob[3]);
+            } else {
+                var parts = FRAME.split(",");
+                FL = parseFloat(parts[0]); FT = parseFloat(parts[1]);
+                FR = parseFloat(parts[2]); FB = parseFloat(parts[3]);
+            }
+            var FW = FR - FL, FH = FB - FT;
 
-            // Ставим новое изображение поверх текущего содержимого.
-            var f = new File(NEW_PATH);
+            // Штатная замена содержимого смарт-объекта.
             var d = new ActionDescriptor();
-            d.putPath(charIDToTypeID('null'), f);
-            d.putEnumerated(charIDToTypeID('FTcs'), charIDToTypeID('QCSt'), charIDToTypeID('Qcsa'));
-            executeAction(charIDToTypeID('Plc '), d, DialogModes.NO);
-            var placed = doc.activeLayer;
+            d.putPath(charIDToTypeID('null'), new File(NEW_PATH));
+            try { d.putInteger(charIDToTypeID('PgNm'), 1); } catch(e) {}
+            executeAction(stringIDToTypeID('placedLayerReplaceContents'),
+                          d, DialogModes.NO);
 
-            var pb = placed.bounds;
-            var pw = asPx(pb[2]) - asPx(pb[0]);
-            var ph = asPx(pb[3]) - asPx(pb[1]);
+            so = doc.activeLayer;
 
-            if (pw > 0 && ph > 0 && MODE !== 'original') {
-                var scale;
-                if (MODE === 'fill') {
-                    scale = Math.max(W / pw, H / ph);
-                } else {
-                    scale = Math.min(W / pw, H / ph);
+            // Подгон масштаба SO-слоя под рамку (fit/fill).
+            if (MODE !== 'original' && FW > 0 && FH > 0) {
+                var b = so.bounds;
+                var w = asPx(b[2]) - asPx(b[0]);
+                var h = asPx(b[3]) - asPx(b[1]);
+                if (w > 0 && h > 0) {
+                    var scale;
+                    if (MODE === 'fill') {
+                        scale = Math.max(FW / w, FH / h);
+                    } else {
+                        scale = Math.min(FW / w, FH / h);
+                    }
+                    if (NO_UPSCALE && scale > 1.0) scale = 1.0;
+                    so.resize(scale * 100.0, scale * 100.0,
+                              AnchorPosition.MIDDLECENTER);
                 }
-                if (NO_UPSCALE && scale > 1.0) scale = 1.0;
-                var pct = scale * 100.0;
-                placed.resize(pct, pct, AnchorPosition.MIDDLECENTER);
             }
 
-            // Центрируем по канвасу.
-            pb = placed.bounds;
-            var cx = (asPx(pb[0]) + asPx(pb[2])) / 2;
-            var cy = (asPx(pb[1]) + asPx(pb[3])) / 2;
-            placed.translate((L + R) / 2 - cx, (T + Bt) / 2 - cy);
-
-            try { placed.rasterize(RasterizeType.ENTIRELAYER); } catch(e) {}
-
-            // Сводим документ смарт-объекта в один слой размером с канвас —
-            // это и есть чистая база для следующей замены (bounds больше не
-            // «схлопываются» до предыдущего фото).
-            try { doc.flatten(); } catch(e) {}
+            // Центрируем по рамке.
+            var nb = so.bounds;
+            var cx = (asPx(nb[0]) + asPx(nb[2])) / 2;
+            var cy = (asPx(nb[1]) + asPx(nb[3])) / 2;
+            so.translate((FL + FR) / 2 - cx, (FT + FB) / 2 - cy);
 
             app.preferences.rulerUnits = savedRulerUnits;
             app.preferences.typeUnits  = savedTypeUnits;
 
-            return "SO_CANVAS|" + W + "|" + H + "|" + MODE;
+            return FL + "|" + FT + "|" + FR + "|" + FB;
         })();
         """
         jsx = (jsx
                .replace("__PATH__", path_literal)
                .replace("__MODE__", mode_literal)
-               .replace("__NO_UPSCALE__", no_upscale_literal))
+               .replace("__NO_UPSCALE__", no_upscale_literal)
+               .replace("__FRAME__", frame_literal))
         result = self._ps.app.DoJavaScript(jsx)
-        parts = str(result).strip().split("|") if result is not None else []
-        if len(parts) >= 3:
-            self._log(f"SO canvas replace: {parts[1]}x{parts[2]}px, mode={parts[3] if len(parts) > 3 else mode}", "info")
+        raw = str(result).strip() if result is not None else ""
+        parts = raw.split("|")
+        if len(parts) == 4:
+            try:
+                frame = tuple(float(p) for p in parts)
+                self._log(
+                    f"SO replace: frame "
+                    f"{frame[2]-frame[0]:.0f}x{frame[3]-frame[1]:.0f}px, mode={mode}",
+                    "info",
+                )
+                return frame
+            except ValueError:
+                pass
+        return None
 
     def _activate_target_raster_in_active_doc(self) -> None:
         jsx = r"""
@@ -616,9 +613,6 @@ class PsdToolsFrame(ttk.Frame):
                 try { return L.kind === LayerKind.SMARTOBJECT; } catch(e){ return false; }
             }
 
-            // pickBiggest: рекурсивно ищем самый большой НЕ-SO слой по площади
-            // bounds. Это самый надёжный способ найти "главный" растровый слой
-            // внутри смарт-объекта, когда там есть служебные мелкие слои.
             var best = null;
             var bestArea = -1;
             function walkBiggest(container) {
@@ -634,9 +628,6 @@ class PsdToolsFrame(ttk.Frame):
             }
             walkBiggest(doc);
 
-            // Fallback: если ни у одного слоя нет непустых bounds — берём
-            // первый не-SO (в т.ч. пустой), последний шанс — просто первый
-            // artLayer какой есть.
             function pickAny(container) {
                 for (var i = 0; i < container.artLayers.length; i++) {
                     var L = container.artLayers[i];
@@ -656,12 +647,13 @@ class PsdToolsFrame(ttk.Frame):
         """
         self._ps.app.DoJavaScript(jsx)
 
-    def _replace_layer_content(self, layer, image_path: str, mode: str) -> None:
+    def _replace_layer_content(self, layer, image_path: str, mode: str,
+                               frame_key: Optional[str] = None) -> None:
         if _is_group(layer):
             raise RuntimeError("Selected item is a group (LayerSet), not a photo layer.")
 
         if _is_smart_object(layer):
-            self._replace_smart_object(layer, image_path, mode)
+            self._replace_smart_object(layer, image_path, mode, frame_key)
         else:
             self._replace_raster_merge_down(layer, image_path, mode)
 
@@ -698,13 +690,9 @@ class PsdToolsFrame(ttk.Frame):
             var L = asPx(b[0]), T = asPx(b[1]), R = asPx(b[2]), Bt = asPx(b[3]);
             var W = R - L, H = Bt - T;
 
-            // Диагностический размер target ДО fallback на канвас — вернём
-            // в Python для лога, чтобы сразу видеть, тот ли слой выбран.
             var diagW = W, diagH = H;
             var usedCanvas = false;
 
-            // Fallback: если у слоя нет пикселей (маска/пустой растр внутри SO)
-            // — используем канвас документа как рамку.
             if (W <= 0 || H <= 0) {
                 L  = 0;
                 T  = 0;
@@ -715,13 +703,6 @@ class PsdToolsFrame(ttk.Frame):
                 usedCanvas = true;
             }
 
-            // Если сработал canvas-fallback (target был пустой), режим 'fit'
-            // почти всегда оставляет по краям другие слои документа —
-            // placed вписывается по короткой стороне, вдоль длинной остаются
-            // полосы. Форсим 'fill': placed заполнит весь холст, обрежется
-            // по длинной стороне, а нижние слои будут полностью скрыты.
-            // Пользователь в UI по-прежнему видит свой выбор — это только
-            // локальный override для этого запуска.
             var effectiveMode = MODE;
             if (usedCanvas && MODE === 'fit') { effectiveMode = 'fill'; }
             if (W <= 0 || H <= 0) {
@@ -758,8 +739,6 @@ class PsdToolsFrame(ttk.Frame):
                 } else {
                     scale = Math.min(W / pw, H / ph);
                 }
-                // Если target был пустой (usedCanvas) — игнорируем NO_UPSCALE,
-                // иначе маленькая картинка не растянется на пустой плейсхолдер.
                 if (NO_UPSCALE && !usedCanvas && scale > 1.0) scale = 1.0;
                 var pct = scale * 100.0;
                 placed.resize(pct, pct, AnchorPosition.MIDDLECENTER);
@@ -787,14 +766,6 @@ class PsdToolsFrame(ttk.Frame):
                 } catch(e) {}
             }
 
-            // Основной путь — слить placed вниз в target (сохраняет позицию
-            // в стеке, эффекты и режим наложения исходного слоя).
-            // Fallback: если merge недоступен (Photoshop error 8800 —
-            // "Команда 'Объединить слои' в данный момент недоступна", например
-            // когда под placed нет подходящего растрового слоя — только
-            // Background/SO/один слой внутри смарт-объекта), удаляем старый
-            // target и оставляем placed как замену. Для Background слоя
-            // предварительно снимаем isBackgroundLayer, иначе .remove() падает.
             var mergeStatus = "MERGED";
             try {
                 placed.merge();
@@ -817,8 +788,6 @@ class PsdToolsFrame(ttk.Frame):
             app.preferences.rulerUnits = savedRulerUnits;
             app.preferences.typeUnits  = savedTypeUnits;
 
-            // Возвращаем строку с диагностикой:
-            //   STATUS|W|H|usedCanvas|effectiveMode
             return mergeStatus + "|" + diagW + "|" + diagH
                  + "|" + (usedCanvas ? "1" : "0")
                  + "|" + effectiveMode;
@@ -852,8 +821,6 @@ class PsdToolsFrame(ttk.Frame):
                 "маркером [SO]",
                 "warn",
             )
-            # Отдельно сигналим про авто-переключение режима, чтобы
-            # пользователь не удивлялся, почему картинка обрезалась.
             if effective_mode != mode:
                 self._log(
                     f"mode '{mode}' → '{effective_mode}' (auto): при "
@@ -861,8 +828,6 @@ class PsdToolsFrame(ttk.Frame):
                     "по краям, поэтому placed растянут по длинной стороне",
                     "warn",
                 )
-            # Дублируем предупреждение в видимый warning-лейбл UI —
-            # чтобы даже без свёрнутого журнала пользователь заметил.
             try:
                 self._warn.configure(
                     text="⚠ Выбран пустой слой (0×0). Использован canvas-"
@@ -908,10 +873,12 @@ class PsdToolsFrame(ttk.Frame):
             return
 
         self._log(f"Batch: {len(images)} image(s) → layer '{name}'", "info")
+        frame_key = json.dumps(path)
         for img in images:
             try:
                 layer = self._resolve_layer(path)
-                self._replace_layer_content(layer, str(img), self._mode_var.get())
+                self._replace_layer_content(layer, str(img), self._mode_var.get(),
+                                            frame_key=frame_key)
                 target = out_dir / f"{self._psd_path.stem}__{img.stem}.psd"
                 self._doc.SaveAs(str(target))
                 self._log(f"Saved: {target.name}", "ok")
