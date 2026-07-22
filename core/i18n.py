@@ -4,7 +4,6 @@ from __future__ import annotations
 from typing import Callable
 
 STRINGS: dict[str, dict[str, str]] = {
-    # Common ---------------------------------------------------------------
     "app.title":            {"ru": "Prizma Studio",                    "en": "Prizma Studio"},
     "app.tagline":          {"ru": "PDF + PSD в одном окне",            "en": "PDF + PSD in a single window"},
     "tab.pdf":              {"ru": "PDF Tools",                         "en": "PDF Tools"},
@@ -24,7 +23,6 @@ STRINGS: dict[str, dict[str, str]] = {
     "common.save":          {"ru": "Сохранить",                         "en": "Save"},
     "common.open":          {"ru": "Открыть",                           "en": "Open"},
 
-    # PDF tab --------------------------------------------------------------
     "pdf.open":             {"ru": "Открыть PDF",                       "en": "Open PDF"},
     "pdf.save":             {"ru": "Сохранить как…",                    "en": "Save as…"},
     "pdf.close":            {"ru": "Закрыть",                           "en": "Close"},
@@ -56,7 +54,6 @@ STRINGS: dict[str, dict[str, str]] = {
     "pdf.opened":           {"ru": "Открыт:",                           "en": "Opened:"},
     "pdf.merge.title":      {"ru": "Выберите PDF-файлы для слияния",    "en": "Select PDF files to merge"},
 
-    # PSD tab --------------------------------------------------------------
     "psd.open":             {"ru": "Открыть PSD/PSB",                   "en": "Open PSD/PSB"},
     "psd.scan":             {"ru": "Сканировать слои",                  "en": "Scan layers"},
     "psd.unlock":           {"ru": "Разблокировать все слои",           "en": "Unlock all layers"},
@@ -70,12 +67,10 @@ STRINGS: dict[str, dict[str, str]] = {
     "psd.mode.original":    {"ru": "Original (сохранить формат)",       "en": "Original (keep format)"},
     "psd.mode.hint":        {"ru": "Fit — вписать с полями · Fill — заполнить с обрезкой · Original — сохранить пропорции нового фото (без обрезки и искажений)",
                              "en": "Fit — inside with margins · Fill — crop to fill · Original — preserve new photo aspect (no crop, no distortion)"},
-    "psd.no_upscale":       {"ru": "Не увеличивать (сохранить резкость)",
-                             "en": "No upscaling (keep sharpness)"},
-    "psd.crop_bbox":        {"ru": "Обрезать по рамке слоя",
-                             "en": "Crop to layer bbox"},
-    "psd.quality.hint":     {"ru": "«Не увеличивать» — если новое фото меньше рамки, оно не растягивается (иначе Photoshop дорисовывает пиксели → мыло). «Обрезать по рамке» — новое фото не вылезет за оригинальный размер слоя. Ресемплинг: Bicubic Sharper.",
-                             "en": "“No upscaling” — if the new photo is smaller than the frame, it will not be enlarged (upscaling forces Photoshop to invent pixels → blur). “Crop to bbox” — the new photo cannot bleed past the original layer frame. Resampling: Bicubic Sharper."},
+    "psd.no.upscale":       {"ru": "Не увеличивать (сохранять резкость)",
+                             "en": "Don't upscale (keep sharpness)"},
+    "psd.clip.bounds":      {"ru": "Обрезать по рамке слоя",
+                             "en": "Clip to layer bounds"},
     "psd.depth":            {"ru": "Глубина Smart Object",              "en": "Smart Object depth"},
     "psd.section.file":     {"ru": "Файл",                              "en": "File"},
     "psd.section.layers":   {"ru": "Слои",                              "en": "Layers"},
@@ -88,7 +83,6 @@ STRINGS: dict[str, dict[str, str]] = {
     "psd.done":             {"ru": "Готово",                            "en": "Done"},
     "psd.processing":       {"ru": "Обработка…",                        "en": "Processing…"},
 
-    # Settings tab ---------------------------------------------------------
     "settings.language":    {"ru": "Язык интерфейса",                   "en": "Interface language"},
     "settings.theme":       {"ru": "Тема оформления",                   "en": "Theme"},
     "settings.theme.system":{"ru": "Системная",                         "en": "System"},
@@ -102,7 +96,6 @@ STRINGS: dict[str, dict[str, str]] = {
     "settings.restart":     {"ru": "Изменение языка применяется мгновенно.",
                              "en": "Language change is applied instantly."},
 
-    # About tab ------------------------------------------------------------
     "about.name":           {"ru": "Prizma Studio",                     "en": "Prizma Studio"},
     "about.version":        {"ru": "Версия",                            "en": "Version"},
     "about.author":         {"ru": "Автор",                             "en": "Author"},
@@ -116,15 +109,12 @@ STRINGS: dict[str, dict[str, str]] = {
     },
     "about.tech":           {"ru": "Технологии",                        "en": "Technologies"},
 
-    # Errors ---------------------------------------------------------------
     "error.title":          {"ru": "Ошибка",                            "en": "Error"},
     "info.title":           {"ru": "Информация",                        "en": "Information"},
 }
 
 
 class I18N:
-    """Simple translator with an observer pattern for live re-translation."""
-
     def __init__(self, language: str = "ru") -> None:
         self._lang = language if language in ("ru", "en") else "ru"
         self._subscribers: list[Callable[[], None]] = []
@@ -154,5 +144,4 @@ class I18N:
         return entry.get(self._lang) or entry.get("ru") or key
 
 
-# Singleton translator.
 i18n = I18N()

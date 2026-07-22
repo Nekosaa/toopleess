@@ -506,11 +506,96 @@ class PsdToolsFrame(ttk.Frame):
 
         so_doc = self._ps.app.ActiveDocument
         try:
-            self._activate_target_raster_in_active_doc()
-            self._run_merge_down_jsx(image_path, mode)
+            self._run_so_canvas_replace_jsx(image_path, mode)
             so_doc.Save()
         finally:
             so_doc.Close(2)
+
+    def _run_so_canvas_replace_jsx(self, image_path: str, mode: str) -> None:
+        """Чистая, повторяемая замена содержимого смарт-объекта.
+
+        Вписываем новое фото в КАНВАС смарт-объекта (фиксированный размер,
+        который никогда не «сжимается»), после чего сводим документ. Благодаря
+        этому вторая и последующие замены дают тот же кадр, что и первая —
+        раньше фото вписывалось в bounds внутреннего слоя, которые после
+        merge-down уменьшались до размера прошлого фото, и картинка с каждым
+        разом мельчала / уезжала."""
+        path_literal = json.dumps(str(Path(image_path)))
+        mode_literal = json.dumps(mode)
+        no_upscale_literal = "true" if bool(config.get("psd_no_upscale", True)) else "false"
+
+        jsx = r"""
+        (function () {
+            var NEW_PATH   = __PATH__;
+            var MODE       = __MODE__;
+            var NO_UPSCALE = __NO_UPSCALE__;
+
+            var doc = app.activeDocument;
+
+            var savedRulerUnits = app.preferences.rulerUnits;
+            var savedTypeUnits  = app.preferences.typeUnits;
+            app.preferences.rulerUnits = Units.PIXELS;
+            app.preferences.typeUnits  = TypeUnits.PIXELS;
+
+            function asPx(v){ try { return v.as('px'); } catch(e){ return Number(v); } }
+
+            // Рамка = весь канвас смарт-объекта (не bounds внутреннего слоя).
+            var L = 0, T = 0;
+            var R  = asPx(doc.width);
+            var Bt = asPx(doc.height);
+            var W = R - L, H = Bt - T;
+
+            // Ставим новое изображение поверх текущего содержимого.
+            var f = new File(NEW_PATH);
+            var d = new ActionDescriptor();
+            d.putPath(charIDToTypeID('null'), f);
+            d.putEnumerated(charIDToTypeID('FTcs'), charIDToTypeID('QCSt'), charIDToTypeID('Qcsa'));
+            executeAction(charIDToTypeID('Plc '), d, DialogModes.NO);
+            var placed = doc.activeLayer;
+
+            var pb = placed.bounds;
+            var pw = asPx(pb[2]) - asPx(pb[0]);
+            var ph = asPx(pb[3]) - asPx(pb[1]);
+
+            if (pw > 0 && ph > 0 && MODE !== 'original') {
+                var scale;
+                if (MODE === 'fill') {
+                    scale = Math.max(W / pw, H / ph);
+                } else {
+                    scale = Math.min(W / pw, H / ph);
+                }
+                if (NO_UPSCALE && scale > 1.0) scale = 1.0;
+                var pct = scale * 100.0;
+                placed.resize(pct, pct, AnchorPosition.MIDDLECENTER);
+            }
+
+            // Центрируем по канвасу.
+            pb = placed.bounds;
+            var cx = (asPx(pb[0]) + asPx(pb[2])) / 2;
+            var cy = (asPx(pb[1]) + asPx(pb[3])) / 2;
+            placed.translate((L + R) / 2 - cx, (T + Bt) / 2 - cy);
+
+            try { placed.rasterize(RasterizeType.ENTIRELAYER); } catch(e) {}
+
+            // Сводим документ смарт-объекта в один слой размером с канвас —
+            // это и есть чистая база для следующей замены (bounds больше не
+            // «схлопываются» до предыдущего фото).
+            try { doc.flatten(); } catch(e) {}
+
+            app.preferences.rulerUnits = savedRulerUnits;
+            app.preferences.typeUnits  = savedTypeUnits;
+
+            return "SO_CANVAS|" + W + "|" + H + "|" + MODE;
+        })();
+        """
+        jsx = (jsx
+               .replace("__PATH__", path_literal)
+               .replace("__MODE__", mode_literal)
+               .replace("__NO_UPSCALE__", no_upscale_literal))
+        result = self._ps.app.DoJavaScript(jsx)
+        parts = str(result).strip().split("|") if result is not None else []
+        if len(parts) >= 3:
+            self._log(f"SO canvas replace: {parts[1]}x{parts[2]}px, mode={parts[3] if len(parts) > 3 else mode}", "info")
 
     def _activate_target_raster_in_active_doc(self) -> None:
         jsx = r"""

@@ -8,19 +8,22 @@ from typing import Any
 CONFIG_PATH = Path.home() / ".tools_config.json"
 
 DEFAULTS: dict[str, Any] = {
-    "language": "ru",           # ru | en
-    "theme": "system",          # system | light | dark
+    "language": "ru",
+    "theme": "system",
     "pdf_last_dir": str(Path.home()),
     "psd_in_dir": str(Path.home()),
     "psd_out_dir": str(Path.home()),
     "smart_object_depth": 3,
     "window_geometry": "1200x760",
+    # PSD Tools – previously non-persistent UI state:
+    "psd_mode": "fit",
+    "psd_no_upscale": True,
+    "psd_clip_to_bounds": True,
+    "last_tab": 0,
 }
 
 
 class Config:
-    """Thin wrapper over a JSON file with dict-like access."""
-
     def __init__(self, path: Path = CONFIG_PATH) -> None:
         self._path = path
         self._data: dict[str, Any] = dict(DEFAULTS)
@@ -58,5 +61,4 @@ class Config:
         return dict(self._data)
 
 
-# Singleton – all tabs share the same config instance.
 config = Config()

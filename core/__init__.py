@@ -1,5 +1,7 @@
-"""Prizma Studio – core package."""
-__version__ = "1.0.0"
-__author__ = "MurKasKaa"
+"""Prizma Studio – core package metadata."""
+
 __app_name__ = "Prizma Studio"
-__exe_name__ = "PrizmaStudio"
+__author__   = "Prizma Studio"
+__version__  = "1.0.4"
+
+__all__ = ["__app_name__", "__author__", "__version__"]

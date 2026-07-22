@@ -1,1 +1,1 @@
-"""Prizma Studio – modules package."""
+"""Prizma Studio modules."""
