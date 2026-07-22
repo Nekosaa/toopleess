@@ -21,16 +21,29 @@ def _is_windows() -> bool:
 # Layer-type helpers (robust across Photoshop builds / locales)
 # ---------------------------------------------------------------------------
 def _is_group(layer) -> bool:
-    """LayerSet detection via duck-typing: groups have a .Layers collection."""
+    """LayerSet detection: только у групп есть .ArtLayers / .LayerSets
+    подколлекции. У ArtLayer обращение к ним бросает исключение.
+    Проверяем несколько атрибутов подряд — разные сборки PS выставляют
+    их по-разному."""
+    for attr in ("LayerSets", "ArtLayers", "Layers"):
+        try:
+            _ = getattr(layer, attr).Count
+            return True
+        except Exception:
+            continue
     try:
-        _ = layer.Layers.Count
-        return True
+        tn = str(getattr(layer, "Typename", "")).lower()
+        if "layerset" in tn or tn in ("set", "group"):
+            return True
     except Exception:
         pass
+    # Финальный сигнал: у LayerSet нет .Kind (обращение падает),
+    # а у ArtLayer .Kind всегда возвращает int.
     try:
-        return "layerset" in str(getattr(layer, "Typename", "")).lower()
-    except Exception:
+        _ = int(getattr(layer, "Kind"))
         return False
+    except Exception:
+        return True
 
 
 def _is_smart_object(layer) -> bool:
@@ -119,7 +132,7 @@ class PsdToolsFrame(ttk.Frame):
         self._ps: Optional[PhotoshopBridge] = None
         self._doc = None
         self._psd_path: Optional[Path] = None
-        self._layers_index: list[tuple[str, list[int]]] = []
+        self._layers_index: list[tuple[str, list]] = []
 
         self._mode_var = tk.StringVar(value=config.get("psd_mode", "fit"))
         self._no_upscale_var = tk.BooleanVar(value=bool(config.get("psd_no_upscale", True)))
@@ -342,18 +355,45 @@ class PsdToolsFrame(ttk.Frame):
         self._walk(self._doc, path=[], depth=0, max_depth=max_depth)
         self._log(f"Layers scanned: {len(self._layers_index)}", "info")
 
-    def _walk(self, container, path: list[int], depth: int, max_depth: int) -> None:
+    def _enumerate_children(self, container) -> list:
+        """Возвращает список (layer, ('L'|'A'|'S', idx)) для детей контейнера.
+        Пробуем сначала .Layers (даёт исходный порядок как в панели PS).
+        Если .Layers пустая или недоступна — берём .ArtLayers + .LayerSets
+        по отдельности (для сборок PS, где .Layers на LayerSet не работает)."""
+        out: list = []
         try:
-            layer_count = container.Layers.Count
+            n = int(container.Layers.Count)
         except Exception:
-            return
-        for i in range(1, layer_count + 1):
-            try:
-                layer = container.Layers.Item(i)
-            except Exception:
-                continue
+            n = 0
+        if n > 0:
+            for i in range(1, n + 1):
+                try:
+                    out.append((container.Layers.Item(i), ("L", i)))
+                except Exception:
+                    continue
+            return out
+        # Fallback: собираем детей отдельно
+        try:
+            for i in range(1, int(container.ArtLayers.Count) + 1):
+                try:
+                    out.append((container.ArtLayers.Item(i), ("A", i)))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        try:
+            for i in range(1, int(container.LayerSets.Count) + 1):
+                try:
+                    out.append((container.LayerSets.Item(i), ("S", i)))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return out
 
-            name = getattr(layer, "Name", f"Layer {i}")
+    def _walk(self, container, path: list, depth: int, max_depth: int) -> None:
+        for layer, key in self._enumerate_children(container):
+            name = getattr(layer, "Name", f"Layer {key[1]}")
             indent = "  " * depth
 
             is_group = _is_group(layer)
@@ -364,12 +404,25 @@ class PsdToolsFrame(ttk.Frame):
                 marker = "  [G]"
             elif is_so:
                 marker = "  [SO]"
+            else:
+                # Маркер [empty] для обычных растровых слоёв с пустыми
+                # bounds (0×0). Клик по такому слою в Replace → canvas-
+                # fallback, а не аккуратная замена внутри рамки. Помечаем
+                # заранее, чтобы пользователь видел это ещё до Replace.
+                try:
+                    b = layer.Bounds
+                    w = float(b[2]) - float(b[0])
+                    h = float(b[3]) - float(b[1])
+                    if w <= 0 or h <= 0:
+                        marker = "  [empty]"
+                except Exception:
+                    pass
 
             self._listbox.insert("end", f"{indent}{name}{marker}")
-            self._layers_index.append((name, path + [i]))
+            self._layers_index.append((name, path + [key]))
 
-            if is_group:
-                self._walk(layer, path + [i], depth + 1, max_depth)
+            if is_group and depth < max_depth:
+                self._walk(layer, path + [key], depth + 1, max_depth)
 
     def unlock_all(self) -> None:
         if not self._ensure_ps() or self._doc is None:
@@ -424,10 +477,22 @@ class PsdToolsFrame(ttk.Frame):
             messagebox.showerror(i18n.t("error.title"), str(exc))
             self._log(str(exc), "error")
 
-    def _resolve_layer(self, path: list[int]):
+    def _resolve_layer(self, path: list):
+        """path — список либо int (старый формат), либо кортежей
+        ('L'|'A'|'S', idx) — новый формат для сборок PS, где .Layers
+        на LayerSet может не работать."""
         node = self._doc
-        for idx in path:
-            node = node.Layers.Item(idx)
+        for step in path:
+            if isinstance(step, tuple):
+                kind, idx = step
+                if kind == "A":
+                    node = node.ArtLayers.Item(idx)
+                elif kind == "S":
+                    node = node.LayerSets.Item(idx)
+                else:
+                    node = node.Layers.Item(idx)
+            else:
+                node = node.Layers.Item(step)
         return node
 
     def _replace_smart_object(self, so_layer, image_path: str, mode: str) -> None:
@@ -564,6 +629,16 @@ class PsdToolsFrame(ttk.Frame):
                 H  = Bt - T;
                 usedCanvas = true;
             }
+
+            // Если сработал canvas-fallback (target был пустой), режим 'fit'
+            // почти всегда оставляет по краям другие слои документа —
+            // placed вписывается по короткой стороне, вдоль длинной остаются
+            // полосы. Форсим 'fill': placed заполнит весь холст, обрежется
+            // по длинной стороне, а нижние слои будут полностью скрыты.
+            // Пользователь в UI по-прежнему видит свой выбор — это только
+            // локальный override для этого запуска.
+            var effectiveMode = MODE;
+            if (usedCanvas && MODE === 'fit') { effectiveMode = 'fill'; }
             if (W <= 0 || H <= 0) {
                 app.preferences.rulerUnits = savedRulerUnits;
                 app.preferences.typeUnits  = savedTypeUnits;
@@ -591,15 +666,15 @@ class PsdToolsFrame(ttk.Frame):
             var pw = asPx(pb[2]) - asPx(pb[0]);
             var ph = asPx(pb[3]) - asPx(pb[1]);
 
-            if (pw > 0 && ph > 0 && MODE !== 'original') {
+            if (pw > 0 && ph > 0 && effectiveMode !== 'original') {
                 var scale;
-                if (MODE === 'fill') {
+                if (effectiveMode === 'fill') {
                     scale = Math.max(W / pw, H / ph);
                 } else {
                     scale = Math.min(W / pw, H / ph);
                 }
                 // Если target был пустой (usedCanvas) — игнорируем NO_UPSCALE,
-                // иначе маленькая картинка не растянется на холст плейсхолдера.
+                // иначе маленькая картинка не растянется на пустой плейсхолдер.
                 if (NO_UPSCALE && !usedCanvas && scale > 1.0) scale = 1.0;
                 var pct = scale * 100.0;
                 placed.resize(pct, pct, AnchorPosition.MIDDLECENTER);
@@ -657,8 +732,11 @@ class PsdToolsFrame(ttk.Frame):
             app.preferences.rulerUnits = savedRulerUnits;
             app.preferences.typeUnits  = savedTypeUnits;
 
-            // Возвращаем строку с диагностикой: STATUS|W|H|usedCanvas
-            return mergeStatus + "|" + diagW + "|" + diagH + "|" + (usedCanvas ? "1" : "0");
+            // Возвращаем строку с диагностикой:
+            //   STATUS|W|H|usedCanvas|effectiveMode
+            return mergeStatus + "|" + diagW + "|" + diagH
+                 + "|" + (usedCanvas ? "1" : "0")
+                 + "|" + effectiveMode;
         })();
         """
         jsx = (jsx
@@ -676,6 +754,7 @@ class PsdToolsFrame(ttk.Frame):
         diag_w = parts[1] if len(parts) > 1 else "?"
         diag_h = parts[2] if len(parts) > 2 else "?"
         used_canvas = parts[3] == "1" if len(parts) > 3 else False
+        effective_mode = parts[4] if len(parts) > 4 else mode
         self._log(
             f"target bounds: {diag_w}x{diag_h}px"
             + (" (fallback → canvas, NO_UPSCALE ignored)" if used_canvas else ""),
@@ -688,6 +767,30 @@ class PsdToolsFrame(ttk.Frame):
                 "маркером [SO]",
                 "warn",
             )
+            # Отдельно сигналим про авто-переключение режима, чтобы
+            # пользователь не удивлялся, почему картинка обрезалась.
+            if effective_mode != mode:
+                self._log(
+                    f"mode '{mode}' → '{effective_mode}' (auto): при "
+                    "canvas-fallback режим Fit оставляет полосы старого фото "
+                    "по краям, поэтому placed растянут по длинной стороне",
+                    "warn",
+                )
+            # Дублируем предупреждение в видимый warning-лейбл UI —
+            # чтобы даже без свёрнутого журнала пользователь заметил.
+            try:
+                self._warn.configure(
+                    text="⚠ Выбран пустой слой (0×0). Использован canvas-"
+                         "fallback + режим Fill. Для корректной замены "
+                         "выбирай слой с маркером [SO]."
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                self._warn.configure(text="")
+            except Exception:
+                pass
         if status == "FALLBACK":
             self._log(
                 "merge_down unavailable (PS 8800): исходный слой удалён, "
