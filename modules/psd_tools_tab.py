@@ -15,6 +15,7 @@ from core.i18n import i18n
 
 # ===== Импорт модуля умной подмены =====
 from modules.image_replace import resize_with_mode
+from modules.so_picker import SOPickerWindow
 try:
     from PIL import Image
     PIL_AVAILABLE = True
@@ -186,8 +187,9 @@ class PsdToolsFrame(ttk.Frame):
         self._btn_unlck = ttk.Button(toolbar, text=i18n.t("psd.unlock"), command=self.unlock_all)
         self._btn_repl = ttk.Button(toolbar, text=i18n.t("psd.replace"), command=self.replace_in_selected)
         self._btn_auto = ttk.Button(toolbar, text="Авто фото", command=self.auto_replace_photo)
+        self._btn_picker = ttk.Button(toolbar, text="Выбор SO", command=self.open_so_picker)
         for i, b in enumerate((self._btn_open, self._btn_scan, self._btn_unlck,
-                                self._btn_repl, self._btn_auto)):
+                                self._btn_repl, self._btn_auto, self._btn_picker)):
             b.grid(row=0, column=i, padx=(0, 6))
 
         left = ttk.Frame(self)
@@ -561,9 +563,12 @@ class PsdToolsFrame(ttk.Frame):
     # ============================================================
 
     def _replace_smart_object(self, so_layer, image_path: str, mode: str,
-                              frame_key: Optional[str] = None) -> None:
+                              frame_key: Optional[str] = None,
+                              isolate: bool = False) -> None:
         """
         Всегда fill в точный размер рамки SO. Как фото на документы.
+        isolate=True → сначала разлинковать SO (placedLayerNewViaCopy),
+        чтобы не затрагивать связанные копии.
         """
         self._doc.ActiveLayer = so_layer
 
@@ -591,18 +596,22 @@ class PsdToolsFrame(ttk.Frame):
         stored = self._so_frames.get(frame_key) if frame_key else None
         frame_literal = ",".join(f"{v:.3f}" for v in stored) if stored else "AUTO"
 
-        returned = self._run_so_replace_contents_jsx(prepared_path, "exact", frame_literal)
+        returned = self._run_so_replace_contents_jsx(
+            prepared_path, "exact", frame_literal, isolate=isolate,
+        )
         if frame_key and returned:
             self._so_frames[frame_key] = returned
 
-    def _run_so_replace_contents_jsx(self, image_path: str, mode: str,
-                                     frame_literal: str):
-        path_literal = json.dumps(str(Path(image_path)))
+def _run_so_replace_contents_jsx(self, image_path: str, mode: str,
+                                 frame_literal: str, isolate: bool = False):
+    path_literal = json.dumps(str(Path(image_path)))
+    isolate_literal = "true" if isolate else "false"
 
-        jsx = r"""
+    jsx = r"""
 (function () {
     var NEW_PATH = __PATH__;
     var FRAME = "__FRAME__";
+    var ISOLATE = __ISOLATE__;
 
     var doc = app.activeDocument;
     var so = doc.activeLayer;
@@ -613,6 +622,26 @@ class PsdToolsFrame(ttk.Frame):
     app.preferences.typeUnits = TypeUnits.PIXELS;
 
     function asPx(v){ try { return v.as('px'); } catch(e){ return Number(v); } }
+
+    // Читаем угол поворота SO из placed layer descriptor
+    function readSORotationAngle() {
+        try {
+            var ref = new ActionReference();
+            ref.putEnumerated(charIDToTypeID("Lyr "),
+                              charIDToTypeID("Ordn"),
+                              charIDToTypeID("Trgt"));
+            var lyrDesc = executeActionGet(ref);
+            var soDesc = lyrDesc.getObjectValue(stringIDToTypeID("smartObject"));
+            var tList = soDesc.getList(stringIDToTypeID("transform"));
+            // transform = 8 doubles: [tl_x, tl_y, tr_x, tr_y, br_x, br_y, bl_x, bl_y]
+            var tl_x = tList.getDouble(0), tl_y = tList.getDouble(1);
+            var tr_x = tList.getDouble(2), tr_y = tList.getDouble(3);
+            var dx = tr_x - tl_x, dy = tr_y - tl_y;
+            return Math.atan2(dy, dx) * 180 / Math.PI;
+        } catch(e) {
+            return 0;
+        }
+    }
 
     var FL, FT, FR, FB;
     if (FRAME === "AUTO") {
@@ -626,6 +655,15 @@ class PsdToolsFrame(ttk.Frame):
     }
     var FW = FR - FL, FH = FB - FT;
 
+    // РАЗЛИНКОВКА связанных SO копий (New Smart Object Via Copy)
+    if (ISOLATE) {
+        try {
+            executeAction(stringIDToTypeID("placedLayerNewViaCopy"),
+                          undefined, DialogModes.NO);
+            so = doc.activeLayer;
+        } catch(e) {}
+    }
+
     // Замена содержимого SO
     var d = new ActionDescriptor();
     d.putPath(charIDToTypeID('null'), new File(NEW_PATH));
@@ -635,7 +673,17 @@ class PsdToolsFrame(ttk.Frame):
 
     so = doc.activeLayer;
 
-    // Жёсткий подгон SO в размер FW×FH (aspect уже правильный из Python).
+    // Обнуление поворота, если он был
+    var angle = readSORotationAngle();
+    var didRotate = false;
+    if (Math.abs(angle) > 0.1) {
+        try {
+            so.rotate(-angle, AnchorPosition.MIDDLECENTER);
+            didRotate = true;
+        } catch(e) {}
+    }
+
+    // Теперь SO axis-aligned — корректный подгон в FW×FH
     if (FW > 0 && FH > 0) {
         var b = so.bounds;
         var w = asPx(b[2]) - asPx(b[0]);
@@ -656,24 +704,33 @@ class PsdToolsFrame(ttk.Frame):
     app.preferences.rulerUnits = savedRulerUnits;
     app.preferences.typeUnits = savedTypeUnits;
 
-    return FL + "|" + FT + "|" + FR + "|" + FB;
+    return FL + "|" + FT + "|" + FR + "|" + FB + "|" + angle.toFixed(2)
+           + "|" + (didRotate ? "1" : "0");
 })();
 """
-        jsx = jsx.replace("__PATH__", path_literal).replace("__FRAME__", frame_literal)
-        result = self._ps.app.DoJavaScript(jsx)
-        raw = str(result).strip() if result is not None else ""
-        parts = raw.split("|")
-        if len(parts) == 4:
-            try:
-                frame = tuple(float(p) for p in parts)
-                self._log(
-                    f"SO replace: frame {frame[2]-frame[0]:.0f}x{frame[3]-frame[1]:.0f}px, mode=exact-fill",
-                    "info",
-                )
-                return frame
-            except ValueError:
-                pass
-        return None
+    jsx = (jsx
+           .replace("__PATH__", path_literal)
+           .replace("__FRAME__", frame_literal)
+           .replace("__ISOLATE__", isolate_literal))
+    result = self._ps.app.DoJavaScript(jsx)
+    raw = str(result).strip() if result is not None else ""
+    parts = raw.split("|")
+    if len(parts) >= 4:
+        try:
+            frame = tuple(float(p) for p in parts[:4])
+            angle = float(parts[4]) if len(parts) > 4 else 0.0
+            did_rot = parts[5] == "1" if len(parts) > 5 else False
+            mode_str = "exact-fill+isolated" if isolate else "exact-fill"
+            rot_str = f", rotation={angle:.1f}° (reset)" if did_rot else ""
+            self._log(
+                f"SO replace: frame {frame[2]-frame[0]:.0f}x{frame[3]-frame[1]:.0f}px, "
+                f"mode={mode_str}{rot_str}",
+                "info",
+            )
+            return frame
+        except ValueError:
+            pass
+    return None
 
     # ============================================================
     # RASTER REPLACE (merge down)
@@ -761,8 +818,6 @@ class PsdToolsFrame(ttk.Frame):
     executeAction(charIDToTypeID('Plc '), d, DialogModes.NO);
     var placed = doc.activeLayer;
 
-    // Жёстко подгоняем placed в размер W×H (без сохранения aspect,
-    // потому что Python уже привёл картинку к правильному aspect через fill+crop)
     var pb = placed.bounds;
     var pw = asPx(pb[2]) - asPx(pb[0]);
     var ph = asPx(pb[3]) - asPx(pb[1]);
@@ -772,7 +827,6 @@ class PsdToolsFrame(ttk.Frame):
         placed.resize(sx * 100.0, sy * 100.0, AnchorPosition.MIDDLECENTER);
     }
 
-    // Центрируем
     pb = placed.bounds;
     var cx = (asPx(pb[0]) + asPx(pb[2])) / 2;
     var cy = (asPx(pb[1]) + asPx(pb[3])) / 2;
@@ -827,6 +881,73 @@ class PsdToolsFrame(ttk.Frame):
         )
         if status == "FALLBACK":
             self._log("merge_down недоступен: placed оставлен вместо target", "warn")
+
+    # ============================================================
+    # SO PICKER — окно выбора одного SO с превью (изолированная замена)
+    # ============================================================
+
+    def open_so_picker(self) -> None:
+        """Открыть окно со всеми SO-слоями и превью."""
+        if not self._ensure_ps() or self._doc is None:
+            self._log(i18n.t("psd.no.file"), "warn")
+            return
+
+        if not self._layers_index:
+            self.scan_layers()
+
+        so_layers: list[tuple[str, list, tuple]] = []
+        for (name, path) in self._layers_index:
+            try:
+                layer = self._resolve_layer(path)
+            except Exception:
+                continue
+            if _is_group(layer):
+                continue
+            if not _is_smart_object(layer):
+                continue
+            try:
+                b = layer.Bounds
+                bounds = (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+            except Exception:
+                bounds = (0.0, 0.0, 0.0, 0.0)
+            so_layers.append((name, path, bounds))
+
+        if not so_layers:
+            messagebox.showinfo(
+                i18n.t("info.title"),
+                "В PSD не найдено ни одного Smart Object.",
+            )
+            return
+
+        self._log(f"SO picker: найдено {len(so_layers)} SO-слоёв", "info")
+
+        SOPickerWindow(
+            master=self,
+            so_layers=so_layers,
+            psd_path=self._psd_path,
+            on_replace=self._on_so_picked,
+        )
+
+    def _on_so_picked(self, name: str, path: list, image_path: str) -> None:
+        """Callback от SO picker — замена только этой копии (isolate=True)."""
+        try:
+            layer = self._resolve_layer(path)
+            if not _is_smart_object(layer):
+                raise RuntimeError(f"Слой '{name}' не является Smart Object")
+
+            self._replace_smart_object(
+                layer, image_path,
+                mode="fill",
+                frame_key=json.dumps(path),
+                isolate=True,
+            )
+            self._log(
+                f"SO picker: заменено только в '{name}' (связанные копии не тронуты)",
+                "ok",
+            )
+        except Exception as exc:
+            messagebox.showerror(i18n.t("error.title"), str(exc))
+            self._log(str(exc), "error")
 
     # ============================================================
     # АВТОПОИСК СЛОЯ ДЛЯ ФОТО
@@ -918,7 +1039,6 @@ class PsdToolsFrame(ttk.Frame):
 
         name, path = found
 
-        # Подсветим слой
         try:
             for idx, (nm, pt) in enumerate(self._layers_index):
                 if nm == name and pt == path:
@@ -1006,8 +1126,8 @@ class PsdToolsFrame(ttk.Frame):
         ]
         for widget, key in pairs:
             widget.configure(text=i18n.t(key))
-        # "Авто фото" — без i18n, просто русский текст
         self._btn_auto.configure(text="Авто фото")
+        self._btn_picker.configure(text="Выбор SO")
         self._lbl_layers.configure(text=i18n.t("psd.section.layers"))
         self._lbl_actions.configure(text=i18n.t("psd.section.actions"))
         self._lbl_batch.configure(text=i18n.t("psd.section.batch"))
