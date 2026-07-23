@@ -1,302 +1,186 @@
 """
 Image replacement module with metadata inheritance.
 Prizma Studio - Smart Image Replacement
+v2 - fixed: no more tiny image in center, defaults to fill.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Literal, Optional, Tuple
-from PIL import Image, ImageOps
-import io
+from PIL import Image
 
-# Type aliases
-ResizeMode = Literal["fit", "fill", "stretch", "match_original"]
+ResizeMode = Literal["fit", "fill", "stretch", "match_original", "cover"]
 
 
 class ImageMetadata:
     """Stores complete metadata of an image."""
-    
+
     def __init__(self, image_path: str | Path):
         self.path = Path(image_path)
-        
         with Image.open(self.path) as img:
-            self.size = img.size  # (width, height)
-            self.mode = img.mode  # RGB, RGBA, CMYK, L, etc.
-            self.format = img.format  # PNG, JPEG, TIFF, etc.
-            self.dpi = img.info.get("dpi", (72, 72))  # (x_dpi, y_dpi)
-            
-            # For JPEG: quality and subsampling
-            self.quality = 95  # default
-            self.subsampling = 0  # default
-            
+            self.size = img.size
+            self.mode = img.mode
+            self.format = img.format
+            self.dpi = img.info.get("dpi", (72, 72))
+            self.quality = 95
+            self.subsampling = 0
             if self.format == "JPEG":
-                # Try to detect quality from quantization tables
                 try:
-                    qtables = getattr(img, "quantization", None)
-                    if qtables:
-                        # Estimate quality from quantization table
+                    if getattr(img, "quantization", None):
                         self.quality = self._estimate_jpeg_quality(img)
-                except:
+                except Exception:
                     pass
-            
-            # Store other format-specific info
             self.info = img.info.copy()
-    
+
     @staticmethod
     def _estimate_jpeg_quality(img: Image.Image) -> int:
-        """Estimate JPEG quality from quantization tables."""
-        # This is a simplified estimation
-        # Real quality detection is complex and not always accurate
         try:
             qtables = img.quantization
             if qtables and len(qtables) > 0:
-                # Average the quantization values
-                avg_quant = sum(sum(row) for row in qtables[0]) / (8 * 8)
-                # Rough estimation: lower quant = higher quality
-                if avg_quant < 10:
-                    return 95
-                elif avg_quant < 20:
-                    return 85
-                elif avg_quant < 40:
-                    return 75
-                else:
+                first = qtables[list(qtables.keys())[0]] if isinstance(qtables, dict) else qtables[0]
+                if isinstance(first, (list, tuple)):
+                    flat = []
+                    for row in first:
+                        if isinstance(row, (list, tuple)):
+                            flat.extend(row)
+                        else:
+                            flat.append(row)
+                    avg = sum(flat) / max(len(flat), 1)
+                    if avg < 10: return 95
+                    if avg < 20: return 85
+                    if avg < 40: return 75
                     return 65
-        except:
+        except Exception:
             pass
-        return 85  # default
-    
+        return 85
+
     def __repr__(self) -> str:
-        return (
-            f"ImageMetadata(size={self.size}, mode={self.mode}, "
-            f"format={self.format}, dpi={self.dpi})"
-        )
+        return f"ImageMetadata(size={self.size}, mode={self.mode}, format={self.format}, dpi={self.dpi})"
 
 
 def resize_with_mode(
     img: Image.Image,
     target_size: Tuple[int, int],
-    mode: ResizeMode,
-    no_upscale: bool = True
+    mode: ResizeMode = "fill",
+    no_upscale: bool = False,
 ) -> Image.Image:
     """
-    Resize image according to specified mode.
-    
-    Args:
-        img: Source PIL Image
-        target_size: (width, height) target dimensions
-        mode: Resize strategy
-            - "fit": Fit inside target, preserve aspect ratio, add padding
-            - "fill": Fill target, preserve aspect ratio, crop excess
-            - "stretch": Stretch to exact target size
-            - "match_original": Same as stretch for this function
-        no_upscale: If True, don't upscale smaller images
-    
-    Returns:
-        Resized PIL Image
+    Resize image to target_size.
+
+    Modes:
+      - "fill" / "cover"   : preserve aspect, fill entire target, crop excess (RECOMMENDED default)
+      - "fit"              : preserve aspect, fit inside, transparent padding (RGBA)
+      - "stretch" / "match_original" : ignore aspect, exact target size
+
+    no_upscale=False by default — small source will be scaled UP to fit target.
     """
-    target_w, target_h = target_size
-    src_w, src_h = img.size
-    
-    # Check if upscaling is disabled
-    if no_upscale and src_w <= target_w and src_h <= target_h and mode != "stretch":
+    target_w, target_h = int(target_size[0]), int(target_size[1])
+    if target_w <= 0 or target_h <= 0:
         return img.copy()
-    
-    if mode == "stretch" or mode == "match_original":
-        # Simple resize to exact dimensions
-        return img.resize(target_size, Image.Resampling.LANCZOS)
-    
-    elif mode == "fit":
-        # Fit inside target, preserve aspect ratio
-        img_copy = img.copy()
-        img_copy.thumbnail(target_size, Image.Resampling.LANCZOS)
-        
-        # Create new image with target size and paste centered
-        result = Image.new(img.mode, target_size, color=(255, 255, 255))
-        
-        # Calculate position to center the image
-        paste_x = (target_w - img_copy.width) // 2
-        paste_y = (target_h - img_copy.height) // 2
-        
-        result.paste(img_copy, (paste_x, paste_y))
-        return result
-    
-    elif mode == "fill":
-        # Fill target, crop excess, preserve aspect ratio
+
+    src_w, src_h = img.size
+
+    # No-upscale guard (rarely used; off by default now)
+    if no_upscale and src_w <= target_w and src_h <= target_h and mode not in ("stretch", "match_original"):
+        return img.copy()
+
+    if mode in ("stretch", "match_original"):
+        return img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+    if mode in ("fill", "cover"):
         src_aspect = src_w / src_h
         target_aspect = target_w / target_h
-        
         if src_aspect > target_aspect:
-            # Source is wider, scale by height
             new_h = target_h
-            new_w = int(new_h * src_aspect)
+            new_w = max(1, int(round(new_h * src_aspect)))
         else:
-            # Source is taller, scale by width
             new_w = target_w
-            new_h = int(new_w / src_aspect)
-        
-        # Resize to calculated dimensions
+            new_h = max(1, int(round(new_w / src_aspect)))
         img_resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        
-        # Crop to target size (center crop)
         left = (new_w - target_w) // 2
         top = (new_h - target_h) // 2
-        right = left + target_w
-        bottom = top + target_h
-        
-        return img_resized.crop((left, top, right, bottom))
-    
-    else:
-        raise ValueError(f"Unknown resize mode: {mode}")
+        return img_resized.crop((left, top, left + target_w, top + target_h))
+
+    if mode == "fit":
+        img_copy = img.copy()
+        img_copy.thumbnail((target_w, target_h), Image.Resampling.LANCZOS)
+        # Transparent RGBA canvas — no more white borders!
+        if img_copy.mode != "RGBA":
+            img_copy = img_copy.convert("RGBA")
+        result = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+        px = (target_w - img_copy.width) // 2
+        py = (target_h - img_copy.height) // 2
+        result.paste(img_copy, (px, py), img_copy)
+        return result
+
+    raise ValueError(f"Unknown resize mode: {mode}")
 
 
 def replace_matching(
     original_path: str | Path,
     new_path: str | Path,
     output_path: str | Path,
-    mode: ResizeMode = "match_original",
-    no_upscale: bool = True,
-    inherit_metadata: bool = True
+    mode: ResizeMode = "fill",
+    no_upscale: bool = False,
+    inherit_metadata: bool = True,
 ) -> ImageMetadata:
     """
-    Replace image with metadata inheritance.
-    
-    Args:
-        original_path: Path to original image (source of metadata)
-        new_path: Path to new image (will be transformed)
-        output_path: Where to save result
-        mode: Resize mode (fit/fill/stretch/match_original)
-        no_upscale: Don't upscale if new image is smaller
-        inherit_metadata: Apply original's metadata to result
-    
-    Returns:
-        ImageMetadata of the result
+    Replace image, inheriting metadata (size/dpi/format) from original.
+    Default mode is 'fill' — output visually matches the original slot perfectly.
     """
-    # Read original metadata
     orig_meta = ImageMetadata(original_path)
-    
-    # Open new image
+
     with Image.open(new_path) as new_img:
-        # Convert to original's color mode if needed
-        if inherit_metadata and new_img.mode != orig_meta.mode:
+        new_img.load()
+
+        target_size = orig_meta.size
+        result_img = resize_with_mode(new_img, target_size, mode=mode, no_upscale=no_upscale)
+
+        if inherit_metadata and result_img.mode != orig_meta.mode:
             try:
-                new_img = new_img.convert(orig_meta.mode)
+                if orig_meta.mode == "RGB" and result_img.mode == "RGBA":
+                    bg = Image.new("RGB", result_img.size, (255, 255, 255))
+                    bg.paste(result_img, mask=result_img.split()[-1])
+                    result_img = bg
+                else:
+                    result_img = result_img.convert(orig_meta.mode)
             except Exception as e:
-                # Some conversions might fail, log and continue
-                print(f"Warning: Could not convert {new_img.mode} to {orig_meta.mode}: {e}")
-        
-        # Resize according to mode
-        if mode == "match_original" or inherit_metadata:
-            # Force exact size match
-            result_img = resize_with_mode(
-                new_img, 
-                orig_meta.size, 
-                "match_original",
-                no_upscale=no_upscale
-            )
-        else:
-            result_img = resize_with_mode(
-                new_img,
-                orig_meta.size,
-                mode,
-                no_upscale=no_upscale
-            )
-        
-        # Prepare save parameters
+                print(f"[image_replace] mode convert warn: {e}")
+
         save_kwargs = {}
-        
+        output_format = orig_meta.format if inherit_metadata else (Image.open(new_path).format or "PNG")
+        if not output_format:
+            output_format = "PNG"
+
         if inherit_metadata:
-            # Apply DPI
             save_kwargs["dpi"] = orig_meta.dpi
-            
-            # Apply format
-            output_format = orig_meta.format or "PNG"
-            
-            # Format-specific parameters
             if output_format == "JPEG":
                 save_kwargs["quality"] = orig_meta.quality
                 save_kwargs["optimize"] = True
                 save_kwargs["subsampling"] = orig_meta.subsampling
-            
+                if result_img.mode in ("RGBA", "LA", "P"):
+                    result_img = result_img.convert("RGB")
             elif output_format == "PNG":
                 save_kwargs["optimize"] = True
-                # Copy PNG-specific info if available
-                if "transparency" in orig_meta.info:
-                    save_kwargs["transparency"] = orig_meta.info["transparency"]
-            
-            elif output_format == "TIFF":
-                # Copy TIFF compression if available
-                if "compression" in orig_meta.info:
-                    save_kwargs["compression"] = orig_meta.info["compression"]
-        else:
-            # Use new image's format
-            output_format = Image.open(new_path).format or "PNG"
-        
-        # Save result
+
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        result_img.save(
-            output_path,
-            format=output_format,
-            **save_kwargs
-        )
-    
-    # Return metadata of saved image
+        result_img.save(output_path, format=output_format, **save_kwargs)
+
     return ImageMetadata(output_path)
 
 
-def get_metadata_comparison(
-    original_path: str | Path,
-    new_path: str | Path
-) -> dict:
-    """
-    Compare metadata between original and new image.
-    Useful for preview/debugging.
-    
-    Returns:
-        Dictionary with comparison data
-    """
-    orig_meta = ImageMetadata(original_path)
-    new_meta = ImageMetadata(new_path)
-    
+def get_metadata_comparison(original_path, new_path) -> dict:
+    a = ImageMetadata(original_path)
+    b = ImageMetadata(new_path)
     return {
-        "original": {
-            "size": orig_meta.size,
-            "mode": orig_meta.mode,
-            "format": orig_meta.format,
-            "dpi": orig_meta.dpi,
-            "quality": orig_meta.quality if orig_meta.format == "JPEG" else None
-        },
-        "new": {
-            "size": new_meta.size,
-            "mode": new_meta.mode,
-            "format": new_meta.format,
-            "dpi": new_meta.dpi,
-            "quality": new_meta.quality if new_meta.format == "JPEG" else None
-        },
+        "original": {"size": a.size, "mode": a.mode, "format": a.format, "dpi": a.dpi},
+        "new":      {"size": b.size, "mode": b.mode, "format": b.format, "dpi": b.dpi},
         "differences": {
-            "size_match": orig_meta.size == new_meta.size,
-            "mode_match": orig_meta.mode == new_meta.mode,
-            "format_match": orig_meta.format == new_meta.format,
-            "dpi_match": orig_meta.dpi == new_meta.dpi
-        }
+            "size_match": a.size == b.size,
+            "mode_match": a.mode == b.mode,
+            "format_match": a.format == b.format,
+            "dpi_match": a.dpi == b.dpi,
+        },
     }
-
-
-# Convenience function for quick testing
-def quick_replace(original: str, new: str, output: str, mode: str = "match_original"):
-    """Quick replace with default settings."""
-    result = replace_matching(original, new, output, mode=mode)
-    print(f"✓ Replaced: {output}")
-    print(f"  Size: {result.size}, Mode: {result.mode}, DPI: {result.dpi}")
-    return result
-
-
-if __name__ == "__main__":
-    # Example usage / testing
-    print("Image Replace Module - Prizma Studio")
-    print("=" * 50)
-    print("\nUsage example:")
-    print(">>> from modules.image_replace import replace_matching")
-    print(">>> replace_matching('original.jpg', 'new.png', 'output.jpg')")
