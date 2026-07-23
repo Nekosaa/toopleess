@@ -602,12 +602,19 @@ class PsdToolsFrame(ttk.Frame):
         if frame_key and returned:
             self._so_frames[frame_key] = returned
 
-def _run_so_replace_contents_jsx(self, image_path: str, mode: str,
-                                 frame_literal: str, isolate: bool = False):
-    path_literal = json.dumps(str(Path(image_path)))
-    isolate_literal = "true" if isolate else "false"
+    def _run_so_replace_contents_jsx(self, image_path: str, mode: str,
+                                     frame_literal: str, isolate: bool = False):
+        """
+        Auto-detect transform type:
+          - axis-aligned  → exact-fill (resize + translate)
+          - rotation/flip → rotate-resize-translate
+          - skew/perspective → quadrilateral distort (ActionManager transform)
+        Все Layer Effects, blending, opacity, smart filters сохраняются автоматически.
+        """
+        path_literal = json.dumps(str(Path(image_path)))
+        isolate_literal = "true" if isolate else "false"
 
-    jsx = r"""
+        jsx = r"""
 (function () {
     var NEW_PATH = __PATH__;
     var FRAME = "__FRAME__";
@@ -622,9 +629,14 @@ def _run_so_replace_contents_jsx(self, image_path: str, mode: str,
     app.preferences.typeUnits = TypeUnits.PIXELS;
 
     function asPx(v){ try { return v.as('px'); } catch(e){ return Number(v); } }
+    function dist(x1,y1,x2,y2){ var dx=x2-x1, dy=y2-y1; return Math.sqrt(dx*dx+dy*dy); }
 
-    // Читаем угол поворота SO из placed layer descriptor
-    function readSORotationAngle() {
+    // Читаем 8 doubles transform SO: 4 угла в canvas-координатах
+    function readSOQuad() {
+        var o = { ok:false, angle:0, flipped:false, hasSkew:false,
+                  tl_x:0, tl_y:0, tr_x:0, tr_y:0,
+                  br_x:0, br_y:0, bl_x:0, bl_y:0,
+                  cx:0, cy:0, w:0, h:0 };
         try {
             var ref = new ActionReference();
             ref.putEnumerated(charIDToTypeID("Lyr "),
@@ -633,29 +645,83 @@ def _run_so_replace_contents_jsx(self, image_path: str, mode: str,
             var lyrDesc = executeActionGet(ref);
             var soDesc = lyrDesc.getObjectValue(stringIDToTypeID("smartObject"));
             var tList = soDesc.getList(stringIDToTypeID("transform"));
-            // transform = 8 doubles: [tl_x, tl_y, tr_x, tr_y, br_x, br_y, bl_x, bl_y]
-            var tl_x = tList.getDouble(0), tl_y = tList.getDouble(1);
-            var tr_x = tList.getDouble(2), tr_y = tList.getDouble(3);
-            var dx = tr_x - tl_x, dy = tr_y - tl_y;
-            return Math.atan2(dy, dx) * 180 / Math.PI;
-        } catch(e) {
-            return 0;
-        }
+            o.tl_x=tList.getDouble(0); o.tl_y=tList.getDouble(1);
+            o.tr_x=tList.getDouble(2); o.tr_y=tList.getDouble(3);
+            o.br_x=tList.getDouble(4); o.br_y=tList.getDouble(5);
+            o.bl_x=tList.getDouble(6); o.bl_y=tList.getDouble(7);
+
+            var dxTop  = o.tr_x - o.tl_x, dyTop  = o.tr_y - o.tl_y;
+            var dxLeft = o.bl_x - o.tl_x, dyLeft = o.bl_y - o.tl_y;
+
+            o.angle = Math.atan2(dyTop, dxTop) * 180 / Math.PI;
+            var cross = dxTop*dyLeft - dyTop*dxLeft;
+            o.flipped = (cross < 0);
+            o.w = dist(o.tl_x,o.tl_y, o.tr_x,o.tr_y);
+            o.h = dist(o.tl_x,o.tl_y, o.bl_x,o.bl_y);
+            o.cx = (o.tl_x+o.tr_x+o.br_x+o.bl_x)/4;
+            o.cy = (o.tl_y+o.tr_y+o.br_y+o.bl_y)/4;
+
+            // Detect skew/perspective:
+            var wBottom = dist(o.bl_x,o.bl_y, o.br_x,o.br_y);
+            var hRight  = dist(o.tr_x,o.tr_y, o.br_x,o.br_y);
+            var wDiff = Math.abs(o.w - wBottom) / Math.max(o.w, 0.001);
+            var hDiff = Math.abs(o.h - hRight)  / Math.max(o.h, 0.001);
+            var dotTL = dxTop*dxLeft + dyTop*dyLeft;
+            var cosAngle = Math.abs(dotTL / ((o.w * o.h) + 0.001));
+            o.hasSkew = (wDiff > 0.005 || hDiff > 0.005 || cosAngle > 0.01);
+            o.ok = true;
+        } catch(e) {}
+        return o;
     }
 
-    var FL, FT, FR, FB;
-    if (FRAME === "AUTO") {
-        var ob = so.bounds;
-        FL = asPx(ob[0]); FT = asPx(ob[1]);
-        FR = asPx(ob[2]); FB = asPx(ob[3]);
-    } else {
+    // 4-corner distort: current AABB → target quadrilateral
+    function applyQuadDistort(t) {
+        var d = new ActionDescriptor();
+        var r = new ActionReference();
+        r.putEnumerated(charIDToTypeID("Lyr "),
+                        charIDToTypeID("Ordn"),
+                        charIDToTypeID("Trgt"));
+        d.putReference(charIDToTypeID("null"), r);
+
+        var q = new ActionList();
+        q.putUnitDouble(charIDToTypeID("Hrzn"), charIDToTypeID("#Pxl"), t.tl_x);
+        q.putUnitDouble(charIDToTypeID("Vrtc"), charIDToTypeID("#Pxl"), t.tl_y);
+        q.putUnitDouble(charIDToTypeID("Hrzn"), charIDToTypeID("#Pxl"), t.tr_x);
+        q.putUnitDouble(charIDToTypeID("Vrtc"), charIDToTypeID("#Pxl"), t.tr_y);
+        q.putUnitDouble(charIDToTypeID("Hrzn"), charIDToTypeID("#Pxl"), t.br_x);
+        q.putUnitDouble(charIDToTypeID("Vrtc"), charIDToTypeID("#Pxl"), t.br_y);
+        q.putUnitDouble(charIDToTypeID("Hrzn"), charIDToTypeID("#Pxl"), t.bl_x);
+        q.putUnitDouble(charIDToTypeID("Vrtc"), charIDToTypeID("#Pxl"), t.bl_y);
+
+        d.putList(stringIDToTypeID("quadrilateral"), q);
+        try {
+            d.putEnumerated(stringIDToTypeID("interpolation"),
+                            stringIDToTypeID("interpolationType"),
+                            stringIDToTypeID("bicubic"));
+        } catch(e) {}
+        executeAction(stringIDToTypeID("transform"), d, DialogModes.NO);
+    }
+
+    // ===== STEP 1: save target geometry BEFORE replace =====
+    var target = readSOQuad();
+
+    // External FRAME only usable if SO axis-aligned
+    if (FRAME !== "AUTO" && target.ok
+        && !target.hasSkew && Math.abs(target.angle) < 0.5 && !target.flipped) {
         var parts = FRAME.split(",");
-        FL = parseFloat(parts[0]); FT = parseFloat(parts[1]);
-        FR = parseFloat(parts[2]); FB = parseFloat(parts[3]);
+        var FL = parseFloat(parts[0]);
+        var FT = parseFloat(parts[1]);
+        var FR = parseFloat(parts[2]);
+        var FB = parseFloat(parts[3]);
+        target.tl_x=FL; target.tl_y=FT;
+        target.tr_x=FR; target.tr_y=FT;
+        target.br_x=FR; target.br_y=FB;
+        target.bl_x=FL; target.bl_y=FB;
+        target.cx=(FL+FR)/2; target.cy=(FT+FB)/2;
+        target.w=FR-FL; target.h=FB-FT;
     }
-    var FW = FR - FL, FH = FB - FT;
 
-    // РАЗЛИНКОВКА связанных SO копий (New Smart Object Via Copy)
+    // ===== STEP 2: isolate linked SO copies =====
     if (ISOLATE) {
         try {
             executeAction(stringIDToTypeID("placedLayerNewViaCopy"),
@@ -664,73 +730,117 @@ def _run_so_replace_contents_jsx(self, image_path: str, mode: str,
         } catch(e) {}
     }
 
-    // Замена содержимого SO
-    var d = new ActionDescriptor();
-    d.putPath(charIDToTypeID('null'), new File(NEW_PATH));
-    try { d.putInteger(charIDToTypeID('PgNm'), 1); } catch(e) {}
+    // ===== STEP 3: replace contents =====
+    var d0 = new ActionDescriptor();
+    d0.putPath(charIDToTypeID('null'), new File(NEW_PATH));
+    try { d0.putInteger(charIDToTypeID('PgNm'), 1); } catch(e) {}
     executeAction(stringIDToTypeID('placedLayerReplaceContents'),
-                  d, DialogModes.NO);
-
+                  d0, DialogModes.NO);
     so = doc.activeLayer;
 
-    // Обнуление поворота, если он был
-    var angle = readSORotationAngle();
-    var didRotate = false;
-    if (Math.abs(angle) > 0.1) {
-        try {
-            so.rotate(-angle, AnchorPosition.MIDDLECENTER);
-            didRotate = true;
-        } catch(e) {}
-    }
+    // ===== STEP 4: reconstruct geometry =====
+    var current = readSOQuad();
+    var isTransformed = target.ok && (target.hasSkew
+                                      || Math.abs(target.angle) > 1.0
+                                      || target.flipped);
+    var methodUsed = "none";
 
-    // Теперь SO axis-aligned — корректный подгон в FW×FH
-    if (FW > 0 && FH > 0) {
-        var b = so.bounds;
-        var w = asPx(b[2]) - asPx(b[0]);
-        var h = asPx(b[3]) - asPx(b[1]);
-        if (w > 0 && h > 0) {
-            var sx = FW / w;
-            var sy = FH / h;
-            so.resize(sx * 100.0, sy * 100.0, AnchorPosition.MIDDLECENTER);
+    if (target.ok && current.ok) {
+        if (target.hasSkew) {
+            // Normalize SO to axis-aligned first
+            if (Math.abs(current.angle) > 0.01) {
+                so.rotate(-current.angle, AnchorPosition.MIDDLECENTER);
+            }
+            if (current.flipped) {
+                so.resize(-100.0, 100.0, AnchorPosition.MIDDLECENTER);
+            }
+            // Then distort current AABB to target quadrilateral
+            applyQuadDistort(target);
+            methodUsed = "quad-distort";
+        } else {
+            // Rotation + flip case
+            if (Math.abs(current.angle) > 0.01) {
+                so.rotate(-current.angle, AnchorPosition.MIDDLECENTER);
+            }
+            if (current.flipped !== target.flipped) {
+                so.resize(-100.0, 100.0, AnchorPosition.MIDDLECENTER);
+            }
+            var b = so.bounds;
+            var w = asPx(b[2]) - asPx(b[0]);
+            var h = asPx(b[3]) - asPx(b[1]);
+            if (w > 0 && h > 0 && target.w > 0 && target.h > 0) {
+                so.resize(target.w/w*100.0, target.h/h*100.0, AnchorPosition.MIDDLECENTER);
+            }
+            var nb = so.bounds;
+            var cx = (asPx(nb[0]) + asPx(nb[2])) / 2;
+            var cy = (asPx(nb[1]) + asPx(nb[3])) / 2;
+            so.translate(target.cx - cx, target.cy - cy);
+            if (Math.abs(target.angle) > 0.01) {
+                so.rotate(target.angle, AnchorPosition.MIDDLECENTER);
+            }
+            methodUsed = isTransformed ? "rotate-resize" : "exact-fill";
         }
     }
-
-    // Центрируем по рамке
-    var nb = so.bounds;
-    var cx = (asPx(nb[0]) + asPx(nb[2])) / 2;
-    var cy = (asPx(nb[1]) + asPx(nb[3])) / 2;
-    so.translate((FL + FR) / 2 - cx, (FT + FB) / 2 - cy);
 
     app.preferences.rulerUnits = savedRulerUnits;
     app.preferences.typeUnits = savedTypeUnits;
 
-    return FL + "|" + FT + "|" + FR + "|" + FB + "|" + angle.toFixed(2)
-           + "|" + (didRotate ? "1" : "0");
+    return target.tl_x + "|" + target.tl_y + "|" + target.tr_x + "|" + target.tr_y
+         + "|" + target.br_x + "|" + target.br_y + "|" + target.bl_x + "|" + target.bl_y
+         + "|" + target.angle.toFixed(2)
+         + "|" + (target.flipped ? "1" : "0")
+         + "|" + (target.hasSkew ? "1" : "0")
+         + "|" + (isTransformed ? "1" : "0")
+         + "|" + target.w.toFixed(1) + "|" + target.h.toFixed(1)
+         + "|" + methodUsed;
 })();
 """
-    jsx = (jsx
-           .replace("__PATH__", path_literal)
-           .replace("__FRAME__", frame_literal)
-           .replace("__ISOLATE__", isolate_literal))
-    result = self._ps.app.DoJavaScript(jsx)
-    raw = str(result).strip() if result is not None else ""
-    parts = raw.split("|")
-    if len(parts) >= 4:
-        try:
-            frame = tuple(float(p) for p in parts[:4])
-            angle = float(parts[4]) if len(parts) > 4 else 0.0
-            did_rot = parts[5] == "1" if len(parts) > 5 else False
-            mode_str = "exact-fill+isolated" if isolate else "exact-fill"
-            rot_str = f", rotation={angle:.1f}° (reset)" if did_rot else ""
-            self._log(
-                f"SO replace: frame {frame[2]-frame[0]:.0f}x{frame[3]-frame[1]:.0f}px, "
-                f"mode={mode_str}{rot_str}",
-                "info",
-            )
-            return frame
-        except ValueError:
-            pass
-    return None
+        jsx = (jsx
+               .replace("__PATH__", path_literal)
+               .replace("__FRAME__", frame_literal)
+               .replace("__ISOLATE__", isolate_literal))
+        result = self._ps.app.DoJavaScript(jsx)
+        raw = str(result).strip() if result is not None else ""
+        parts = raw.split("|")
+
+        if len(parts) >= 8:
+            try:
+                corners = tuple(float(p) for p in parts[:8])
+                angle = float(parts[8]) if len(parts) > 8 else 0.0
+                flipped = parts[9] == "1" if len(parts) > 9 else False
+                has_skew = parts[10] == "1" if len(parts) > 10 else False
+                transformed = parts[11] == "1" if len(parts) > 11 else False
+                true_w = float(parts[12]) if len(parts) > 12 else 0.0
+                true_h = float(parts[13]) if len(parts) > 13 else 0.0
+                method = parts[14] if len(parts) > 14 else "?"
+
+                xs = [corners[0], corners[2], corners[4], corners[6]]
+                ys = [corners[1], corners[3], corners[5], corners[7]]
+                frame = (min(xs), min(ys), max(xs), max(ys))
+
+                iso_str = "+isolated" if isolate else ""
+                if transformed:
+                    tags = []
+                    if abs(angle) > 1.0:
+                        tags.append(f"rot={angle:.1f}°")
+                    if flipped:
+                        tags.append("flipped")
+                    if has_skew:
+                        tags.append("skew/perspective")
+                    mode_str = f"{method} ({', '.join(tags)}){iso_str}"
+                    size_str = f"true {true_w:.0f}x{true_h:.0f}px"
+                else:
+                    mode_str = f"exact-fill{iso_str}"
+                    size_str = f"{frame[2]-frame[0]:.0f}x{frame[3]-frame[1]:.0f}px"
+
+                self._log(
+                    f"SO replace: frame {size_str}, mode={mode_str}",
+                    "info",
+                )
+                return frame
+            except ValueError:
+                pass
+        return None
 
     # ============================================================
     # RASTER REPLACE (merge down)
