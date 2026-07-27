@@ -562,6 +562,46 @@ class PsdToolsFrame(ttk.Frame):
     # SMART OBJECT REPLACE (ЖЁСТКО fill в размер рамки)
     # ============================================================
 
+    def _read_so_true_size(self) -> Optional[tuple[float, float]]:
+        """
+        Читает ИСТИННЫЕ длины рёбер трансформ-quad'а активного SO
+        (не AABB!) через ActionManager. Возвращает (true_w, true_h) в пикселях
+        или None, если данные недоступны (linked SO без transform-дескриптора).
+
+        Это критично для повёрнутых/скошенных SO: layer.Bounds даёт axis-aligned
+        bounding box, который имеет другой аспект, чем истинная рамка SO. Если
+        подготовить картинку под AABB, PS применит preserved transform матрицу
+        source → quad, и картинка выйдет с искажением аспекта / артефактами.
+        """
+        jsx = r"""
+(function () {
+    try {
+        var ref = new ActionReference();
+        ref.putEnumerated(charIDToTypeID("Lyr "),
+                          charIDToTypeID("Ordn"),
+                          charIDToTypeID("Trgt"));
+        var lyrDesc = executeActionGet(ref);
+        var soDesc  = lyrDesc.getObjectValue(stringIDToTypeID("smartObject"));
+        var t = soDesc.getList(stringIDToTypeID("transform"));
+        function d(x1,y1,x2,y2){var dx=x2-x1,dy=y2-y1;return Math.sqrt(dx*dx+dy*dy);}
+        var w = d(t.getDouble(0), t.getDouble(1), t.getDouble(2), t.getDouble(3));
+        var h = d(t.getDouble(0), t.getDouble(1), t.getDouble(6), t.getDouble(7));
+        return w.toFixed(3) + "|" + h.toFixed(3);
+    } catch (e) { return "ERR"; }
+})();
+"""
+        try:
+            result = self._ps.app.DoJavaScript(jsx)
+            raw = str(result).strip() if result is not None else ""
+            if raw and raw != "ERR" and "|" in raw:
+                w_str, h_str = raw.split("|", 1)
+                w = float(w_str); h = float(h_str)
+                if w > 0 and h > 0:
+                    return (w, h)
+        except Exception as e:
+            self._log(f"SO true-size read failed: {e}", "warn")
+        return None
+
     def _replace_smart_object(self, so_layer, image_path: str, mode: str,
                               frame_key: Optional[str] = None,
                               isolate: bool = False) -> None:
@@ -572,27 +612,36 @@ class PsdToolsFrame(ttk.Frame):
         """
         self._doc.ActiveLayer = so_layer
 
-        # 1) Целевая рамка SO
-        try:
-            stored_frame = self._so_frames.get(frame_key) if frame_key else None
-            if stored_frame:
-                fl, ft, fr, fb = stored_frame
-            else:
-                b = so_layer.Bounds
-                fl = float(b[0]); ft = float(b[1])
-                fr = float(b[2]); fb = float(b[3])
-            fw = int(round(fr - fl))
-            fh = int(round(fb - ft))
-        except Exception as e:
-            self._log(f"SO bounds read failed: {e}", "warn")
-            fw = fh = 0
+        # 1) Определяем ИСТИННЫЙ размер рамки SO (edge lengths of transform quad).
+        #    Приоритет: transform-descriptor > stored AABB > layer.Bounds.
+        fw = fh = 0
+        true_size = self._read_so_true_size()
+        if true_size:
+            fw = int(round(true_size[0]))
+            fh = int(round(true_size[1]))
+            self._log(f"SO true frame: {fw}x{fh}px (via transform)", "info")
+        else:
+            try:
+                stored_frame = self._so_frames.get(frame_key) if frame_key else None
+                if stored_frame:
+                    fl, ft, fr, fb = stored_frame
+                else:
+                    b = so_layer.Bounds
+                    fl = float(b[0]); ft = float(b[1])
+                    fr = float(b[2]); fb = float(b[3])
+                fw = int(round(fr - fl))
+                fh = int(round(fb - ft))
+                self._log(f"SO AABB fallback: {fw}x{fh}px", "warn")
+            except Exception as e:
+                self._log(f"SO bounds read failed: {e}", "warn")
+                fw = fh = 0
 
-        # 2) Готовим картинку точно в размер рамки
+        # 2) Готовим картинку точно под ИСТИННЫЙ аспект рамки SO (не AABB).
         prepared_path = image_path
         if PIL_AVAILABLE and fw > 0 and fh > 0:
             prepared_path = self._prepare_image_for_psd(image_path, fw, fh)
 
-        # 3) Вызов JSX
+        # 3) Вызов JSX (external FRAME override работает только для axis-aligned)
         stored = self._so_frames.get(frame_key) if frame_key else None
         frame_literal = ",".join(f"{v:.3f}" for v in stored) if stored else "AUTO"
 
