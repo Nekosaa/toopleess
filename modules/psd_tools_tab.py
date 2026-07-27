@@ -17,7 +17,7 @@ from core.i18n import i18n
 from modules.image_replace import resize_with_mode
 from modules.so_picker import SOPickerWindow
 try:
-    from PIL import Image
+    from PIL import Image, ImageFilter
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -142,6 +142,9 @@ class PsdToolsFrame(ttk.Frame):
         "снимок", "picture", "pic", "user photo", "your photo",
     )
 
+    # Порог: если min(sw, sh) < этого значения — спросить у юзера подтверждение
+    _MIN_SOURCE_SIDE = 400
+
     def __init__(self, master: tk.Misc, log: LogFn) -> None:
         super().__init__(master, padding=(12, 8))
         self._log = log
@@ -155,6 +158,10 @@ class PsdToolsFrame(ttk.Frame):
         self._no_upscale_var = tk.BooleanVar(value=bool(config.get("psd_no_upscale", False)))
         self._clip_bounds_var = tk.BooleanVar(value=bool(config.get("psd_clip_to_bounds", True)))
         self._inherit_meta_var = tk.BooleanVar(value=bool(config.get("psd_inherit_metadata", True)))
+
+        # Флаг «пользователь уже подтвердил мелкий исходник в этой сессии» —
+        # чтобы не спрашивать 20 раз при batch.
+        self._small_source_ack = False
 
         self._in_var = tk.StringVar(value=config.get("psd_in_dir"))
         self._out_var = tk.StringVar(value=config.get("psd_out_dir"))
@@ -323,6 +330,9 @@ class PsdToolsFrame(ttk.Frame):
         )
         if not path:
             return
+
+        # Каждый новый PSD — сбрасываем ACK на мелкий исходник
+        self._small_source_ack = False
 
         last_exc: Optional[BaseException] = None
         for attempt in range(3):
@@ -508,7 +518,7 @@ class PsdToolsFrame(ttk.Frame):
         return node
 
     # ============================================================
-    # УМНАЯ ПОДГОТОВКА ИЗОБРАЖЕНИЯ
+    # УМНАЯ ПОДГОТОВКА ИЗОБРАЖЕНИЯ  [PATCH 2 + Вариант A + Вариант B]
     # ============================================================
 
     def _prepare_image_for_psd(
@@ -519,34 +529,93 @@ class PsdToolsFrame(ttk.Frame):
         mode: str = "fill",
     ) -> str:
         """
-        Приводит новое изображение ТОЧНО к размеру слоя (fill+upscale по умолчанию).
-        Как фото на документы: без белых полей, обрезка лишнего по бокам.
+        Готовит картинку под слот.
+        - Уважает UI-настройки (mode, no_upscale).
+        - При min(src) < _MIN_SOURCE_SIDE и не выключенном upscale — спрашивает подтверждение.
+        - При апскейле > 1.5× — применяет LANCZOS resize + мягкий Unsharp Mask,
+          чтобы уменьшить визуальное мыло.
         """
         if not PIL_AVAILABLE:
             self._log("Pillow недоступен, пропускаем подготовку", "warn")
             return new_image_path
-
         if target_width <= 0 or target_height <= 0:
             self._log(f"Target bounds invalid ({target_width}x{target_height})", "warn")
             return new_image_path
 
         try:
+            no_upscale = bool(self._no_upscale_var.get())
+        except Exception:
+            no_upscale = False
+        try:
+            ui_mode = self._mode_var.get() or mode
+        except Exception:
+            ui_mode = mode
+        effective_mode = ui_mode or "fill"
+
+        try:
             with Image.open(new_image_path) as new_img:
                 new_img.load()
+                sw, sh = new_img.size
+                scale = max(target_width / max(sw, 1), target_height / max(sh, 1))
+
+                # ----- Вариант B: жёсткий стоп на мелкий исходник -----
+                if (min(sw, sh) < self._MIN_SOURCE_SIDE
+                        and not no_upscale
+                        and not self._small_source_ack):
+                    proceed = messagebox.askyesno(
+                        "Мелкое фото",
+                        f"Исходник {sw}×{sh}, слот {target_width}×{target_height}"
+                        f" (upscale x{scale:.1f}).\n\n"
+                        f"Результат будет мыльный / пикселизованный — детали "
+                        f"взять неоткуда.\n\n"
+                        f"Продолжить с этим фото?\n"
+                        f"(«Нет» — я возьму фото побольше)",
+                    )
+                    if not proceed:
+                        raise RuntimeError(
+                            f"Отменено: исходник {sw}×{sh} слишком мал для "
+                            f"слота {target_width}×{target_height}"
+                        )
+                    # Помним ACK до конца сессии — не спамим при batch
+                    self._small_source_ack = True
+
+                if scale > 2.0 and not no_upscale:
+                    self._log(
+                        f"⚠ Upscale x{scale:.1f}: исходник {sw}×{sh} мал для "
+                        f"{target_width}×{target_height}. Применяю LANCZOS + sharpen.",
+                        "warn",
+                    )
+
+                # ----- Вариант A: LANCZOS через resize_with_mode + Unsharp -----
                 result_img = resize_with_mode(
                     new_img,
                     (target_width, target_height),
-                    mode="fill",
-                    no_upscale=False,
+                    mode=effective_mode,
+                    no_upscale=no_upscale,
                 )
+
+                # Мягкий sharpen только когда реально апскейлили
+                if scale > 1.5 and not no_upscale:
+                    try:
+                        result_img = result_img.filter(
+                            ImageFilter.UnsharpMask(radius=1.5, percent=110, threshold=3)
+                        )
+                    except Exception as e:
+                        self._log(f"Unsharp failed (skip): {e}", "warn")
+
                 if result_img.mode not in ("RGB", "RGBA"):
                     result_img = result_img.convert("RGB")
+
                 self._log(
-                    f"Prepare: {new_img.size[0]}x{new_img.size[1]} → "
-                    f"{target_width}x{target_height} (fill, upscale)",
+                    f"Prepare: {sw}×{sh} → {result_img.size[0]}×{result_img.size[1]} "
+                    f"({effective_mode}, "
+                    f"{'no-upscale' if no_upscale else f'upscale x{scale:.1f}'})",
                     "info",
                 )
                 return self._save_temp(result_img, new_image_path)
+        except RuntimeError:
+            # Отмена пользователем — пробрасываем наверх, чтобы обработчик показал ошибку
+            raise
         except Exception as e:
             self._log(f"Prepare failed: {e}", "warn")
             return new_image_path
@@ -559,20 +628,23 @@ class PsdToolsFrame(ttk.Frame):
         return str(temp_file)
 
     # ============================================================
-    # SMART OBJECT REPLACE (ЖЁСТКО fill в размер рамки)
+    # SMART OBJECT REPLACE
     # ============================================================
 
-    def _read_so_true_size(self) -> Optional[tuple[float, float]]:
+    # ---------- [PATCH 1] _read_so_true_size ----------
+    def _read_so_true_size(self, so_layer=None) -> Optional[tuple[float, float]]:
         """
-        Читает ИСТИННЫЕ длины рёбер трансформ-quad'а активного SO
-        (не AABB!) через ActionManager. Возвращает (true_w, true_h) в пикселях
-        или None, если данные недоступны (linked SO без transform-дескриптора).
+        Читает истинный размер рамки SO.
+          - Обязательно активирует переданный so_layer до executeActionGet.
+          - Fallback: transform → nonAffineTransform → size (внутр. документ SO).
+          - В лог пишет источник: SO true frame source: transform|nonAffine|size.
+        """
+        if so_layer is not None:
+            try:
+                self._doc.ActiveLayer = so_layer
+            except Exception as e:
+                self._log(f"SO activate before size-read failed: {e}", "warn")
 
-        Это критично для повёрнутых/скошенных SO: layer.Bounds даёт axis-aligned
-        bounding box, который имеет другой аспект, чем истинная рамка SO. Если
-        подготовить картинку под AABB, PS применит preserved transform матрицу
-        source → quad, и картинка выйдет с искажением аспекта / артефактами.
-        """
         jsx = r"""
 (function () {
     try {
@@ -581,23 +653,57 @@ class PsdToolsFrame(ttk.Frame):
                           charIDToTypeID("Ordn"),
                           charIDToTypeID("Trgt"));
         var lyrDesc = executeActionGet(ref);
-        var soDesc  = lyrDesc.getObjectValue(stringIDToTypeID("smartObject"));
-        var t = soDesc.getList(stringIDToTypeID("transform"));
+
+        if (!lyrDesc.hasKey(stringIDToTypeID("smartObject"))) {
+            return "ERR:not_smart_object";
+        }
+        var soDesc = lyrDesc.getObjectValue(stringIDToTypeID("smartObject"));
         function d(x1,y1,x2,y2){var dx=x2-x1,dy=y2-y1;return Math.sqrt(dx*dx+dy*dy);}
-        var w = d(t.getDouble(0), t.getDouble(1), t.getDouble(2), t.getDouble(3));
-        var h = d(t.getDouble(0), t.getDouble(1), t.getDouble(6), t.getDouble(7));
-        return w.toFixed(3) + "|" + h.toFixed(3);
-    } catch (e) { return "ERR"; }
+
+        if (soDesc.hasKey(stringIDToTypeID("transform"))) {
+            var t = soDesc.getList(stringIDToTypeID("transform"));
+            var w = d(t.getDouble(0), t.getDouble(1), t.getDouble(2), t.getDouble(3));
+            var h = d(t.getDouble(0), t.getDouble(1), t.getDouble(6), t.getDouble(7));
+            if (w > 0 && h > 0) return w.toFixed(3)+"|"+h.toFixed(3)+"|transform";
+        }
+        if (soDesc.hasKey(stringIDToTypeID("nonAffineTransform"))) {
+            var n = soDesc.getList(stringIDToTypeID("nonAffineTransform"));
+            var w2 = d(n.getDouble(0), n.getDouble(1), n.getDouble(2), n.getDouble(3));
+            var h2 = d(n.getDouble(0), n.getDouble(1), n.getDouble(6), n.getDouble(7));
+            if (w2 > 0 && h2 > 0) return w2.toFixed(3)+"|"+h2.toFixed(3)+"|nonAffine";
+        }
+        if (soDesc.hasKey(stringIDToTypeID("size"))) {
+            var s = soDesc.getObjectValue(stringIDToTypeID("size"));
+            try {
+                var w3 = s.getUnitDoubleValue(stringIDToTypeID("width"));
+                var h3 = s.getUnitDoubleValue(stringIDToTypeID("height"));
+                if (w3 > 0 && h3 > 0) return w3.toFixed(3)+"|"+h3.toFixed(3)+"|size";
+            } catch(_) {
+                try {
+                    var w4 = s.getDouble(stringIDToTypeID("width"));
+                    var h4 = s.getDouble(stringIDToTypeID("height"));
+                    if (w4 > 0 && h4 > 0) return w4.toFixed(3)+"|"+h4.toFixed(3)+"|size";
+                } catch(__) {}
+            }
+        }
+        return "ERR:no_geometry";
+    } catch (e) { return "ERR:"+e.message; }
 })();
 """
         try:
             result = self._ps.app.DoJavaScript(jsx)
             raw = str(result).strip() if result is not None else ""
-            if raw and raw != "ERR" and "|" in raw:
-                w_str, h_str = raw.split("|", 1)
-                w = float(w_str); h = float(h_str)
-                if w > 0 and h > 0:
-                    return (w, h)
+            if not raw or raw.startswith("ERR"):
+                self._log(f"SO true-size: {raw or 'no result'}", "warn")
+                return None
+            parts = raw.split("|")
+            if len(parts) < 2:
+                return None
+            w = float(parts[0]); h = float(parts[1])
+            src = parts[2] if len(parts) > 2 else "?"
+            if w > 0 and h > 0:
+                self._log(f"SO true frame source: {src}", "info")
+                return (w, h)
         except Exception as e:
             self._log(f"SO true-size read failed: {e}", "warn")
         return None
@@ -605,21 +711,14 @@ class PsdToolsFrame(ttk.Frame):
     def _replace_smart_object(self, so_layer, image_path: str, mode: str,
                               frame_key: Optional[str] = None,
                               isolate: bool = False) -> None:
-        """
-        Всегда fill в точный размер рамки SO. Как фото на документы.
-        isolate=True → сначала разлинковать SO (placedLayerNewViaCopy),
-        чтобы не затрагивать связанные копии.
-        """
         self._doc.ActiveLayer = so_layer
 
-        # 1) Определяем ИСТИННЫЙ размер рамки SO (edge lengths of transform quad).
-        #    Приоритет: transform-descriptor > stored AABB > layer.Bounds.
         fw = fh = 0
-        true_size = self._read_so_true_size()
+        true_size = self._read_so_true_size(so_layer)
         if true_size:
             fw = int(round(true_size[0]))
             fh = int(round(true_size[1]))
-            self._log(f"SO true frame: {fw}x{fh}px (via transform)", "info")
+            self._log(f"SO true frame: {fw}x{fh}px (via descriptor)", "info")
         else:
             try:
                 stored_frame = self._so_frames.get(frame_key) if frame_key else None
@@ -636,12 +735,10 @@ class PsdToolsFrame(ttk.Frame):
                 self._log(f"SO bounds read failed: {e}", "warn")
                 fw = fh = 0
 
-        # 2) Готовим картинку точно под ИСТИННЫЙ аспект рамки SO (не AABB).
         prepared_path = image_path
         if PIL_AVAILABLE and fw > 0 and fh > 0:
             prepared_path = self._prepare_image_for_psd(image_path, fw, fh)
 
-        # 3) Вызов JSX (external FRAME override работает только для axis-aligned)
         stored = self._so_frames.get(frame_key) if frame_key else None
         frame_literal = ",".join(f"{v:.3f}" for v in stored) if stored else "AUTO"
 
@@ -651,14 +748,12 @@ class PsdToolsFrame(ttk.Frame):
         if frame_key and returned:
             self._so_frames[frame_key] = returned
 
+    # ---------- [PATCH 3] _run_so_replace_contents_jsx ----------
     def _run_so_replace_contents_jsx(self, image_path: str, mode: str,
                                      frame_literal: str, isolate: bool = False):
         """
-        Auto-detect transform type:
-          - axis-aligned  → exact-fill (resize + translate)
-          - rotation/flip → rotate-resize-translate
-          - skew/perspective → quadrilateral distort (ActionManager transform)
-        Все Layer Effects, blending, opacity, smart filters сохраняются автоматически.
+        Реальная ошибка placedLayerNewViaCopy возвращается наружу и логируется.
+        Плюс: снимаем selection перед isolate — частая причина фейла.
         """
         path_literal = json.dumps(str(Path(image_path)))
         isolate_literal = "true" if isolate else "false"
@@ -680,7 +775,6 @@ class PsdToolsFrame(ttk.Frame):
     function asPx(v){ try { return v.as('px'); } catch(e){ return Number(v); } }
     function dist(x1,y1,x2,y2){ var dx=x2-x1, dy=y2-y1; return Math.sqrt(dx*dx+dy*dy); }
 
-    // Читаем 8 doubles transform SO: 4 угла в canvas-координатах
     function readSOQuad() {
         var o = { ok:false, angle:0, flipped:false, hasSkew:false,
                   tl_x:0, tl_y:0, tr_x:0, tr_y:0,
@@ -710,7 +804,6 @@ class PsdToolsFrame(ttk.Frame):
             o.cx = (o.tl_x+o.tr_x+o.br_x+o.bl_x)/4;
             o.cy = (o.tl_y+o.tr_y+o.br_y+o.bl_y)/4;
 
-            // Detect skew/perspective:
             var wBottom = dist(o.bl_x,o.bl_y, o.br_x,o.br_y);
             var hRight  = dist(o.tr_x,o.tr_y, o.br_x,o.br_y);
             var wDiff = Math.abs(o.w - wBottom) / Math.max(o.w, 0.001);
@@ -723,7 +816,6 @@ class PsdToolsFrame(ttk.Frame):
         return o;
     }
 
-    // 4-corner distort: current AABB → target quadrilateral
     function applyQuadDistort(t) {
         var d = new ActionDescriptor();
         var r = new ActionReference();
@@ -751,10 +843,8 @@ class PsdToolsFrame(ttk.Frame):
         executeAction(stringIDToTypeID("transform"), d, DialogModes.NO);
     }
 
-    // ===== STEP 1: save target geometry BEFORE replace =====
     var target = readSOQuad();
 
-    // External FRAME only usable if SO axis-aligned
     if (FRAME !== "AUTO" && target.ok
         && !target.hasSkew && Math.abs(target.angle) < 0.5 && !target.flipped) {
         var parts = FRAME.split(",");
@@ -770,16 +860,25 @@ class PsdToolsFrame(ttk.Frame):
         target.w=FR-FL; target.h=FB-FT;
     }
 
-    // ===== STEP 2: isolate linked SO copies =====
+    // isolate — с диагностикой ошибки  [PATCH 3]
+    var isolateStatus = "skip";
+    var soKindBefore = -1;
+    try { soKindBefore = so.kind; } catch(_) {}
+
     if (ISOLATE) {
+        try { doc.selection.deselect(); } catch(_) {}
         try {
             executeAction(stringIDToTypeID("placedLayerNewViaCopy"),
                           undefined, DialogModes.NO);
             so = doc.activeLayer;
-        } catch(e) {}
+            isolateStatus = "ok";
+        } catch(e) {
+            var msg = (e && e.message) ? e.message : String(e);
+            isolateStatus = "FAILED:" + msg + " kind=" + soKindBefore;
+        }
     }
 
-    // ===== STEP 3: replace contents =====
+    // replace contents
     var d0 = new ActionDescriptor();
     d0.putPath(charIDToTypeID('null'), new File(NEW_PATH));
     try { d0.putInteger(charIDToTypeID('PgNm'), 1); } catch(e) {}
@@ -787,7 +886,7 @@ class PsdToolsFrame(ttk.Frame):
                   d0, DialogModes.NO);
     so = doc.activeLayer;
 
-    // ===== STEP 4: reconstruct geometry =====
+    // reconstruct geometry
     var current = readSOQuad();
     var isTransformed = target.ok && (target.hasSkew
                                       || Math.abs(target.angle) > 1.0
@@ -796,18 +895,15 @@ class PsdToolsFrame(ttk.Frame):
 
     if (target.ok && current.ok) {
         if (target.hasSkew) {
-            // Normalize SO to axis-aligned first
             if (Math.abs(current.angle) > 0.01) {
                 so.rotate(-current.angle, AnchorPosition.MIDDLECENTER);
             }
             if (current.flipped) {
                 so.resize(-100.0, 100.0, AnchorPosition.MIDDLECENTER);
             }
-            // Then distort current AABB to target quadrilateral
             applyQuadDistort(target);
             methodUsed = "quad-distort";
         } else {
-            // Rotation + flip case
             if (Math.abs(current.angle) > 0.01) {
                 so.rotate(-current.angle, AnchorPosition.MIDDLECENTER);
             }
@@ -841,7 +937,8 @@ class PsdToolsFrame(ttk.Frame):
          + "|" + (target.hasSkew ? "1" : "0")
          + "|" + (isTransformed ? "1" : "0")
          + "|" + target.w.toFixed(1) + "|" + target.h.toFixed(1)
-         + "|" + methodUsed;
+         + "|" + methodUsed
+         + "|" + isolateStatus;
 })();
 """
         jsx = (jsx
@@ -862,12 +959,20 @@ class PsdToolsFrame(ttk.Frame):
                 true_w = float(parts[12]) if len(parts) > 12 else 0.0
                 true_h = float(parts[13]) if len(parts) > 13 else 0.0
                 method = parts[14] if len(parts) > 14 else "?"
+                iso_status = parts[15] if len(parts) > 15 else "skip"
 
                 xs = [corners[0], corners[2], corners[4], corners[6]]
                 ys = [corners[1], corners[3], corners[5], corners[7]]
                 frame = (min(xs), min(ys), max(xs), max(ys))
 
-                iso_str = "+isolated" if isolate else ""
+                if iso_status == "ok":
+                    iso_str = "+isolated"
+                elif iso_status.startswith("FAILED"):
+                    iso_str = "+isolate_FAILED"
+                    self._log(f"SO isolate FAILED: {iso_status[7:]}", "warn")
+                else:
+                    iso_str = ""
+
                 if transformed:
                     tags = []
                     if abs(angle) > 1.0:
@@ -1042,11 +1147,10 @@ class PsdToolsFrame(ttk.Frame):
             self._log("merge_down недоступен: placed оставлен вместо target", "warn")
 
     # ============================================================
-    # SO PICKER — окно выбора одного SO с превью (изолированная замена)
+    # SO PICKER
     # ============================================================
 
     def open_so_picker(self) -> None:
-        """Открыть окно со всеми SO-слоями и превью."""
         if not self._ensure_ps() or self._doc is None:
             self._log(i18n.t("psd.no.file"), "warn")
             return
@@ -1088,7 +1192,6 @@ class PsdToolsFrame(ttk.Frame):
         )
 
     def _on_so_picked(self, name: str, path: list, image_path: str) -> None:
-        """Callback от SO picker — замена только этой копии (isolate=True)."""
         try:
             layer = self._resolve_layer(path)
             if not _is_smart_object(layer):
@@ -1113,12 +1216,6 @@ class PsdToolsFrame(ttk.Frame):
     # ============================================================
 
     def _find_photo_layer(self) -> Optional[tuple[str, list]]:
-        """
-        Автопоиск слоя-плейсхолдера. Приоритеты:
-        1. SO с ключевым словом в имени (самый большой)
-        2. Растровый слой с ключевым словом
-        3. Самый большой SO
-        """
         if not self._layers_index:
             return None
 
@@ -1176,7 +1273,6 @@ class PsdToolsFrame(ttk.Frame):
         return None
 
     def auto_replace_photo(self) -> None:
-        """Один клик: найти слой + подставить фото."""
         if not self._ensure_ps() or self._doc is None:
             self._log(i18n.t("psd.no.file"), "warn")
             return
@@ -1252,6 +1348,9 @@ class PsdToolsFrame(ttk.Frame):
         if self._doc is None or self._psd_path is None:
             self._log(i18n.t("psd.no.file"), "warn")
             return
+
+        # для batch — сбрасываем ACK, чтобы юзер увидел предупреждение хотя бы раз
+        self._small_source_ack = False
 
         self._log(f"Batch: {len(images)} image(s) → layer '{name}'", "info")
         frame_key = json.dumps(path)
