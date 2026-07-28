@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import sys
 import tkinter as tk
@@ -22,8 +23,10 @@ except ImportError:
 
 LogFn = Callable[[str, str], None]
 
+
 def _is_windows() -> bool:
     return sys.platform.startswith("win")
+
 
 # ---------------------------------------------------------------------------
 # Layer-type helpers
@@ -47,6 +50,7 @@ def _is_group(layer) -> bool:
     except Exception:
         return True
 
+
 def _is_smart_object(layer) -> bool:
     """LayerKind.SMARTOBJECT = 17."""
     try:
@@ -59,6 +63,7 @@ def _is_smart_object(layer) -> bool:
         return "smart" in str(getattr(layer, "Typename", "")).lower()
     except Exception:
         return False
+
 
 class PhotoshopBridge:
     """Wrapper around Photoshop COM."""
@@ -124,6 +129,7 @@ class PhotoshopBridge:
         self.available = False
         self._init_error = "Photoshop COM session lost"
 
+
 class PsdToolsFrame(ttk.Frame):
     # Ключевые слова для автопоиска слоя с фото
     _PHOTO_KEYWORDS = (
@@ -131,6 +137,14 @@ class PsdToolsFrame(ttk.Frame):
         "avatar", "аватар", "headshot", "image edit", "image",
         "снимок", "picture", "pic", "user photo", "your photo",
     )
+
+    # Имена смарт-объектов, куда подставляется ОДНО и то же фото.
+    # В шаблоне фото дублируется в нескольких независимых SO:
+    #   Photo Dark frame → Photo Edit
+    #   Photo light frame → Photo Edit
+    #   Small Photo → Наложение
+    #   (+ Edit Small Photo, если это тоже SO)
+    _PHOTO_SO_NAMES = ("photo edit", "наложение", "edit small photo")
 
     # Порог: если min(sw, sh) < этого значения — спросить у юзера подтверждение
     _MIN_SOURCE_SIDE = 400
@@ -185,8 +199,11 @@ class PsdToolsFrame(ttk.Frame):
         self._btn_repl = ttk.Button(toolbar, text=i18n.t("psd.replace"), command=self.replace_in_selected)
         self._btn_auto = ttk.Button(toolbar, text="Авто фото", command=self.auto_replace_photo)
         self._btn_picker = ttk.Button(toolbar, text="Выбор SO", command=self.open_so_picker)
+        self._btn_all_so = ttk.Button(toolbar, text="Во все SO", command=self.replace_all_so_dialog)
+        self._btn_csv = ttk.Button(toolbar, text="Batch CSV", command=self.batch_csv_replace)
         for i, b in enumerate((self._btn_open, self._btn_scan, self._btn_unlck,
-                               self._btn_repl, self._btn_auto, self._btn_picker)):
+                               self._btn_repl, self._btn_auto, self._btn_picker,
+                               self._btn_all_so, self._btn_csv)):
             b.grid(row=0, column=i, padx=(0, 6))
 
         left = ttk.Frame(self)
@@ -486,7 +503,7 @@ class PsdToolsFrame(ttk.Frame):
         try:
             layer = self._resolve_layer(path)
             self._replace_layer_content(layer, image_path, self._mode_var.get(),
-                                       frame_key=json.dumps(path))
+                                        frame_key=json.dumps(path))
             self._log(f"Replaced photo in '{name}'", "ok")
         except Exception as exc:
             messagebox.showerror(i18n.t("error.title"), str(exc))
@@ -508,7 +525,7 @@ class PsdToolsFrame(ttk.Frame):
         return node
 
     # ============================================================
-    # УМНАЯ ПОДГОТОВКА ИЗОБРАЖЕНИЯ (ИСПРАВЛЕНО)
+    # УМНАЯ ПОДГОТОВКА ИЗОБРАЖЕНИЯ
     # ============================================================
 
     def _prepare_image_for_psd(
@@ -521,11 +538,9 @@ class PsdToolsFrame(ttk.Frame):
         use_padding: bool = False,
     ) -> str:
         """
-        ИСПРАВЛЕНО: добавлен use_padding для Smart Objects.
-        
         Готовит картинку под слот.
         force_mode: если задан ("fill"/"fit"/...), игнорирует режим из UI.
-        use_padding: если True, использует prepare_for_smart_object (ФИКС 2).
+        use_padding: если True, использует prepare_for_smart_object.
         """
         if not PIL_AVAILABLE:
             self._log("Pillow недоступен, пропускаем подготовку", "warn")
@@ -548,6 +563,13 @@ class PsdToolsFrame(ttk.Frame):
                 ui_mode = mode
             effective_mode = ui_mode or "fill"
 
+        # ФИКС: при принудительном fill (Smart Object / raster-fill) нельзя
+        # уважать no_upscale — иначе мелкий исходник (напр. 200×200) не
+        # растянется на весь фрейм SO (1208×1480) и получим крошечное фото
+        # по центру на чёрном фоне.
+        if effective_mode == "fill":
+            no_upscale = False
+
         try:
             with Image.open(new_image_path) as new_img:
                 new_img.load()
@@ -556,8 +578,8 @@ class PsdToolsFrame(ttk.Frame):
 
                 # Проверка на мелкий исходник
                 if (min(sw, sh) < self._MIN_SOURCE_SIDE
-                    and not no_upscale
-                    and not self._small_source_ack):
+                        and not no_upscale
+                        and not self._small_source_ack):
                     proceed = messagebox.askyesno(
                         "Мелкое фото",
                         f"Исходник {sw}×{sh}, слот {target_width}×{target_height}"
@@ -572,11 +594,11 @@ class PsdToolsFrame(ttk.Frame):
 
                 if scale > 2.0 and not no_upscale:
                     self._log(
-                        f"⚠ Upscale x{scale:.1f}: применяю LANCZOS + sharpen.",
+                        f"⚠ Upscale x{scale:.1f}: применяю LANCZOS.",
                         "warn",
                     )
 
-                # ФИКС 2: для SO используем prepare_for_smart_object
+                # для SO с паддингом используем prepare_for_smart_object
                 if use_padding:
                     result_img = prepare_for_smart_object(new_img, target_width, target_height)
                 else:
@@ -588,14 +610,8 @@ class PsdToolsFrame(ttk.Frame):
                         no_upscale=no_upscale,
                     )
 
-                # Sharpen при апскейле
-                if scale > 1.5 and not no_upscale:
-                    try:
-                        result_img = result_img.filter(
-                            ImageFilter.UnsharpMask(radius=1.5, percent=110, threshold=3)
-                        )
-                    except Exception as e:
-                        self._log(f"Unsharp failed (skip): {e}", "warn")
+                # НЕ применяем sharpen — это меняет пиксели и делает
+                # результат "хрустящим", отличным от оригинала.
 
                 if result_img.mode not in ("RGB", "RGBA"):
                     result_img = result_img.convert("RGB")
@@ -612,7 +628,6 @@ class PsdToolsFrame(ttk.Frame):
             return new_image_path
 
     def _save_temp(self, img, original_path: str) -> str:
-        """ИСПРАВЛЕНО: обработка ошибок при сохранении"""
         try:
             temp_dir = Path(original_path).parent / ".prizma_temp"
             temp_dir.mkdir(parents=True, exist_ok=True)
@@ -624,16 +639,14 @@ class PsdToolsFrame(ttk.Frame):
             return original_path
 
     # ============================================================
-    # SMART OBJECT REPLACE (ИСПРАВЛЕНО)
+    # SMART OBJECT REPLACE
     # ============================================================
 
     def _read_so_true_size(self, so_layer=None) -> Optional[tuple[float, float]]:
         """
-        ФИКС 1: Улучшенное чтение нативного размера SO.
-        
         Читает НАТИВНЫЙ размер вложенного контента SO (ключ "size").
         Fallback 1: transform/nonAffine (размер на холсте)
-        Fallback 2: editContents (УЛУЧШЕНИЕ 5)
+        Fallback 2: editContents
         """
         if so_layer is not None:
             try:
@@ -671,8 +684,8 @@ class PsdToolsFrame(ttk.Frame):
                 } catch(__) {}
             }
         }
-        
-        // ФИКС 1: проверка через link (embedded/linked content)
+
+        // проверка через link (embedded/linked content)
         if (soDesc.hasKey(stringIDToTypeID("link"))) {
             var linkDesc = soDesc.getObjectValue(stringIDToTypeID("link"));
             if (linkDesc.hasKey(stringIDToTypeID("size"))) {
@@ -684,8 +697,8 @@ class PsdToolsFrame(ttk.Frame):
                 } catch(_) {}
             }
         }
-        
-        // 2) fallback: размер на холсте (может дать неверный масштаб при перспективе)
+
+        // 2) fallback: размер на холсте
         if (soDesc.hasKey(stringIDToTypeID("transform"))) {
             var t = soDesc.getList(stringIDToTypeID("transform"));
             var w = d(t.getDouble(0), t.getDouble(1), t.getDouble(2), t.getDouble(3));
@@ -707,7 +720,6 @@ class PsdToolsFrame(ttk.Frame):
             raw = str(result).strip() if result is not None else ""
             if not raw or raw.startswith("ERR"):
                 self._log(f"SO true-size: {raw or 'no result'}, trying editContents fallback", "warn")
-                # УЛУЧШЕНИЕ 5: fallback через editContents
                 return self._read_so_size_via_edit_contents(so_layer)
             parts = raw.split("|")
             if len(parts) < 2:
@@ -723,7 +735,7 @@ class PsdToolsFrame(ttk.Frame):
 
     def _read_so_size_via_edit_contents(self, so_layer) -> Optional[tuple[float, float]]:
         """
-        УЛУЧШЕНИЕ 5: Fallback для edge cases.
+        Fallback для edge cases.
         Открывает SO и читает точный размер контента через document dimensions.
         """
         jsx = r"""
@@ -755,8 +767,8 @@ class PsdToolsFrame(ttk.Frame):
         return None
 
     def _replace_smart_object(self, so_layer, image_path: str, mode: str,
-                             frame_key: Optional[str] = None,
-                             isolate: bool = False) -> None:
+                              frame_key: Optional[str] = None,
+                              isolate: bool = False) -> None:
         self._doc.ActiveLayer = so_layer
 
         fw = fh = 0
@@ -781,11 +793,12 @@ class PsdToolsFrame(ttk.Frame):
                 self._log(f"SO bounds read failed: {e}", "warn")
                 fw = fh = 0
 
-        # ФИКС 2: используем prepare_for_smart_object (padding mode)
+        # Заменяем фото ИДЕНТИЧНО оригиналу: режим FILL БЕЗ padding —
+        # иначе появляются белые полосы по краям.
         prepared_path = image_path
         if PIL_AVAILABLE and fw > 0 and fh > 0:
             prepared_path = self._prepare_image_for_psd(
-                image_path, fw, fh, mode="fill", force_mode="fill", use_padding=True
+                image_path, fw, fh, mode="fill", force_mode="fill", use_padding=False
             )
 
         stored = self._so_frames.get(frame_key) if frame_key else None
@@ -800,8 +813,6 @@ class PsdToolsFrame(ttk.Frame):
     def _run_so_replace_contents_jsx(self, image_path: str, mode: str,
                                      frame_literal: str, isolate: bool = False):
         """
-        ФИКС 3: Добавлена проверка correspondence после замены.
-        
         Замена контента Smart Object.
         Photoshop САМ сохраняет трансформацию контейнера (перспектива/наклон/
         поворот), маску слоя и стили (fx).
@@ -877,7 +888,7 @@ class PsdToolsFrame(ttk.Frame):
     try { d0.putInteger(charIDToTypeID('PgNm'), 1); } catch(e) {}
     executeAction(stringIDToTypeID('placedLayerReplaceContents'), d0, DialogModes.NO);
 
-    // ФИКС 3: проверка correspondence после замены
+    // проверка correspondence после замены
     var after = readSOQuad();
     var finalW = 0, finalH = 0;
     try {
@@ -925,8 +936,7 @@ class PsdToolsFrame(ttk.Frame):
                 transformed = parts[11] == "1" if len(parts) > 11 else False
                 method = parts[14] if len(parts) > 14 else "?"
                 iso_status = parts[15] if len(parts) > 15 else "skip"
-                
-                # ФИКС 3: парсим finalSize
+
                 final_size_str = "unknown"
                 if len(parts) > 16 and "finalSize:" in parts[16]:
                     final_size_str = parts[16].replace("finalSize:", "")
@@ -955,7 +965,7 @@ class PsdToolsFrame(ttk.Frame):
     # ============================================================
 
     def _replace_layer_content(self, layer, image_path: str, mode: str,
-                              frame_key: Optional[str] = None) -> None:
+                               frame_key: Optional[str] = None) -> None:
         if _is_group(layer):
             raise RuntimeError("Selected item is a group (LayerSet), not a photo layer.")
 
@@ -972,8 +982,11 @@ class PsdToolsFrame(ttk.Frame):
             target_height = int(float(bounds[3]) - float(bounds[1]))
 
             if target_width > 0 and target_height > 0:
+                # принудительно FILL — новое фото должно ЗАПОЛНИТЬ границы
+                # оригинального слоя ровно как оригинал (без искажений и полей).
                 prepared_path = self._prepare_image_for_psd(
-                    image_path, target_width, target_height
+                    image_path, target_width, target_height,
+                    force_mode="fill", use_padding=False,
                 )
         except Exception as e:
             self._log(f"Prep raster failed: {e}", "warn")
@@ -1146,7 +1159,6 @@ class PsdToolsFrame(ttk.Frame):
         )
 
     def _on_so_picked(self, name: str, path: list, image_path: str) -> None:
-        """ИСПРАВЛЕНО: isolate=False по умолчанию"""
         try:
             layer = self._resolve_layer(path)
             if not _is_smart_object(layer):
@@ -1162,6 +1174,84 @@ class PsdToolsFrame(ttk.Frame):
                 f"SO picker: заменено только в '{name}' (связанные копии не тронуты)",
                 "ok",
             )
+        except Exception as exc:
+            messagebox.showerror(i18n.t("error.title"), str(exc))
+            self._log(str(exc), "error")
+
+    # ============================================================
+    # ЗАМЕНА ВО ВСЕХ ФОТО-SO РАЗОМ
+    # ============================================================
+
+    def replace_photo_in_all_so(self, image_path: str) -> int:
+        """
+        Подставляет ОДНО фото во ВСЕ фото-смартобъекты шаблона
+        (Photo Edit в обоих фреймах + Наложение + Edit Small Photo).
+        В шаблоне фото продублировано в нескольких независимых SO,
+        поэтому замена только одного оставляет остальные со старым фото.
+        Возвращает количество успешно заменённых SO.
+        """
+        targets: list[tuple[str, list]] = []
+        for (name, path) in self._layers_index:
+            try:
+                layer = self._resolve_layer(path)
+            except Exception:
+                continue
+            if _is_group(layer) or not _is_smart_object(layer):
+                continue
+            if name.strip().lower() in self._PHOTO_SO_NAMES:
+                targets.append((name, path))
+
+        if not targets:
+            self._log("Не найдено фото-SO по именам из _PHOTO_SO_NAMES", "warn")
+            return 0
+
+        replaced = 0
+        for name, path in targets:
+            try:
+                layer = self._resolve_layer(path)
+                self._replace_smart_object(
+                    layer, image_path, mode="fill",
+                    frame_key=json.dumps(path), isolate=False,
+                )
+                self._log(f"Заменено в SO '{name}'", "ok")
+                replaced += 1
+            except Exception as exc:
+                self._log(f"SO '{name}': {exc}", "error")
+
+        self._log(f"Замена во всех SO: {replaced}/{len(targets)}", "ok")
+        return replaced
+
+    def replace_all_so_dialog(self) -> None:
+        """Кнопка «Во все SO»: выбрать одно фото и подставить во все фото-SO."""
+        if not self._ensure_ps() or self._doc is None:
+            self._log(i18n.t("psd.no.file"), "warn")
+            return
+        if not self._layers_index:
+            self.scan_layers()
+
+        image_path = filedialog.askopenfilename(
+            title="Фото для всех SO",
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.tif *.tiff *.bmp"), ("All", "*.*")],
+        )
+        if not image_path:
+            return
+
+        # не спрашивать про upscale на каждом SO
+        self._small_source_ack = True
+        try:
+            n = self.replace_photo_in_all_so(image_path)
+            if n == 0:
+                messagebox.showwarning(
+                    i18n.t("info.title"),
+                    "Не найдено ни одного фото-SO для замены.\n\n"
+                    "Проверь имена SO в шаблоне и список _PHOTO_SO_NAMES.",
+                )
+            else:
+                self._log(f"Готово: фото подставлено в {n} SO", "ok")
+                messagebox.showinfo(
+                    i18n.t("info.title"),
+                    f"Фото подставлено в {n} смарт-объект(ов).",
+                )
         except Exception as exc:
             messagebox.showerror(i18n.t("error.title"), str(exc))
             self._log(str(exc), "error")
@@ -1270,18 +1360,17 @@ class PsdToolsFrame(ttk.Frame):
         try:
             layer = self._resolve_layer(path)
             self._replace_layer_content(layer, image_path, self._mode_var.get(),
-                                       frame_key=json.dumps(path))
+                                        frame_key=json.dumps(path))
             self._log(f"Auto: фото подставлено в '{name}'", "ok")
         except Exception as exc:
             messagebox.showerror(i18n.t("error.title"), str(exc))
             self._log(str(exc), "error")
 
     # ============================================================
-    # BATCH (ИСПРАВЛЕНО)
+    # BATCH
     # ============================================================
 
     def batch_replace(self) -> None:
-        """ИСПРАВЛЕНО: добавлен счётчик успешных операций"""
         if not self._ensure_ps():
             return
         in_dir = Path(self._in_var.get() or "")
@@ -1291,7 +1380,7 @@ class PsdToolsFrame(ttk.Frame):
             return
         out_dir.mkdir(parents=True, exist_ok=True)
         images = [p for p in in_dir.iterdir()
-                 if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp")]
+                  if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp")]
         if not images:
             messagebox.showinfo(i18n.t("info.title"), "No images found in in-folder")
             return
@@ -1305,7 +1394,6 @@ class PsdToolsFrame(ttk.Frame):
             self._log(i18n.t("psd.no.file"), "warn")
             return
 
-        # ИСПРАВЛЕНИЕ: сбрасываем ACK перед batch
         self._small_source_ack = False
 
         self._log(f"Batch: {len(images)} image(s) → layer '{name}'", "info")
@@ -1316,7 +1404,7 @@ class PsdToolsFrame(ttk.Frame):
             try:
                 layer = self._resolve_layer(path)
                 self._replace_layer_content(layer, str(img), self._mode_var.get(),
-                                           frame_key=frame_key)
+                                            frame_key=frame_key)
                 target = out_dir / f"{self._psd_path.stem}__{img.stem}.psd"
                 self._doc.SaveAs(str(target))
                 self._log(f"Saved: {target.name}", "ok")
@@ -1325,6 +1413,167 @@ class PsdToolsFrame(ttk.Frame):
                 self._log(f"{img.name}: {exc}", "error")
 
         self._log(f"Batch complete: {success_count}/{len(images)} успешно", "ok")
+
+    # ============================================================
+    # BATCH CSV (мульти-слой мульти-вариант)
+    # ============================================================
+
+    def _find_layer_by_name(self, layer_name: str) -> Optional[tuple[str, list]]:
+        """Ищет слой в _layers_index по точному имени (case-insensitive)."""
+        target = layer_name.strip().lower()
+        for (name, path) in self._layers_index:
+            if name.strip().lower() == target:
+                return (name, path)
+        return None
+
+    def _parse_csv_mapping(self, csv_path: Path) -> tuple[list[str], list[dict]]:
+        """
+        Читает CSV. Возвращает (layer_columns, rows).
+        Первая колонка = output_name, остальные = имена слоёв.
+        Относительные пути резолвятся от папки CSV.
+        """
+        csv_dir = csv_path.parent
+        rows: list[dict] = []
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if not header or len(header) < 2:
+                raise ValueError("CSV должен содержать минимум 2 колонки: output_name, LayerName")
+            layer_columns = [h.strip() for h in header[1:]]
+
+            for line_no, cols in enumerate(reader, start=2):
+                if not cols or all(not c.strip() for c in cols):
+                    continue
+                if len(cols) < 2:
+                    self._log(f"CSV строка {line_no}: пропуск (мало колонок)", "warn")
+                    continue
+                out_name = cols[0].strip()
+                if not out_name:
+                    self._log(f"CSV строка {line_no}: пустой output_name — пропуск", "warn")
+                    continue
+
+                mapping: dict[str, Path] = {}
+                for i, layer_name in enumerate(layer_columns):
+                    if i + 1 >= len(cols):
+                        break
+                    raw = cols[i + 1].strip().strip('"')
+                    if not raw:
+                        continue
+                    p = Path(raw)
+                    if not p.is_absolute():
+                        p = (csv_dir / p).resolve()
+                    if not p.exists():
+                        self._log(
+                            f"CSV строка {line_no}: файл не найден '{p}' — пропуск слоя",
+                            "warn",
+                        )
+                        continue
+                    mapping[layer_name] = p
+
+                if mapping:
+                    rows.append({"output_name": out_name, "photos": mapping})
+        return layer_columns, rows
+
+    def batch_csv_replace(self) -> None:
+        """
+        Батч замены по CSV.
+        1) Открытый PSD = шаблон.
+        2) CSV: output_name, LayerName1, LayerName2, ...
+        3) Для каждой строки: заменить все указанные слои → SaveAs {output_name}.psd.
+        """
+        if not self._ensure_ps() or self._doc is None or self._psd_path is None:
+            self._log(i18n.t("psd.no.file"), "warn")
+            messagebox.showinfo(
+                i18n.t("info.title"),
+                "Сначала откройте PSD-шаблон.",
+            )
+            return
+
+        if not self._layers_index:
+            self.scan_layers()
+
+        csv_path_str = filedialog.askopenfilename(
+            title="CSV с маппингом слоёв",
+            filetypes=[("CSV", "*.csv"), ("All", "*.*")],
+        )
+        if not csv_path_str:
+            return
+        csv_path = Path(csv_path_str)
+
+        out_dir_str = filedialog.askdirectory(
+            title="Папка для выходных PSD",
+            initialdir=self._out_var.get() or str(csv_path.parent),
+        )
+        if not out_dir_str:
+            return
+        out_dir = Path(out_dir_str)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            layer_columns, rows = self._parse_csv_mapping(csv_path)
+        except Exception as exc:
+            messagebox.showerror(i18n.t("error.title"), f"Ошибка чтения CSV: {exc}")
+            self._log(f"CSV parse failed: {exc}", "error")
+            return
+
+        if not rows:
+            messagebox.showinfo(i18n.t("info.title"), "В CSV нет валидных строк.")
+            return
+
+        # Проверка что все слои из header есть в PSD
+        missing = [ln for ln in layer_columns if not self._find_layer_by_name(ln)]
+        if missing:
+            proceed = messagebox.askyesno(
+                "Внимание",
+                "Не найдены слои в PSD:\n • " + "\n • ".join(missing)
+                + "\n\nПродолжить (пропущенные слои игнорируются)?",
+            )
+            if not proceed:
+                return
+
+        self._small_source_ack = True  # не спрашивать 20 раз про upscale
+        self._log(f"CSV batch: {len(rows)} вариант(ов), {len(layer_columns)} слой(ёв)", "info")
+
+        template_path = str(self._psd_path)
+        success = 0
+        for idx, row in enumerate(rows, start=1):
+            out_name = row["output_name"]
+            photos: dict[str, Path] = row["photos"]
+            try:
+                # Каждый раз открываем чистый шаблон, чтобы замены не накапливались
+                if idx > 1:
+                    try:
+                        self._doc.Close(2)  # 2 = DoNotSaveChanges
+                    except Exception:
+                        pass
+                    self._doc = self._ps.open(template_path)
+                    self.scan_layers()
+
+                for layer_name, photo_path in photos.items():
+                    found = self._find_layer_by_name(layer_name)
+                    if not found:
+                        self._log(f"[{out_name}] слой '{layer_name}' не найден — skip", "warn")
+                        continue
+                    _n, path = found
+                    layer = self._resolve_layer(path)
+                    self._replace_layer_content(
+                        layer, str(photo_path), self._mode_var.get(),
+                        frame_key=json.dumps(path),
+                    )
+                    self._log(f"[{out_name}] '{layer_name}' ← {photo_path.name}", "ok")
+
+                target = out_dir / f"{out_name}.psd"
+                self._doc.SaveAs(str(target))
+                self._log(f"Saved: {target.name}", "ok")
+                success += 1
+            except Exception as exc:
+                self._log(f"[{out_name}] FAILED: {exc}", "error")
+
+        self._log(f"CSV batch complete: {success}/{len(rows)} PSD сохранено в {out_dir}", "ok")
+        messagebox.showinfo(
+            i18n.t("info.title"),
+            f"Готово: {success}/{len(rows)} PSD сохранено в:\n{out_dir}",
+        )
 
     def _retranslate(self) -> None:
         pairs = [
@@ -1346,6 +1595,8 @@ class PsdToolsFrame(ttk.Frame):
             widget.configure(text=i18n.t(key))
         self._btn_auto.configure(text="Авто фото")
         self._btn_picker.configure(text="Выбор SO")
+        self._btn_all_so.configure(text="Во все SO")
+        self._btn_csv.configure(text="Batch CSV")
         self._lbl_layers.configure(text=i18n.t("psd.section.layers"))
         self._lbl_actions.configure(text=i18n.t("psd.section.actions"))
         self._lbl_batch.configure(text=i18n.t("psd.section.batch"))
