@@ -1,4 +1,4 @@
-"""Prizma Studio – Modern CustomTkinter UI with bold purple-cyan theme."""
+"""Prizma Studio - главное окно (бирюзово-фиолетовый градиент)."""
 from __future__ import annotations
 
 import sys
@@ -15,560 +15,295 @@ from core import __app_name__, __author__, __version__
 from core.config import config
 from core.i18n import i18n
 from core.ctk_theme import (
-    BG_GRADIENT_START, BG_CARD, ACCENT_CYAN, ACCENT_PURPLE,
-    TEXT_PRIMARY, TEXT_SECONDARY, NEON_GLOW, apply_ctk_theme
+    BG_MAIN, BG_CARD, BG_SIDEBAR, BG_INPUT,
+    ACCENT_CYAN, ACCENT_CYAN_HOVER, ACCENT_PURPLE,
+    TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED,
+    BORDER, SUCCESS, WARNING, ERROR,
+    GRAD_START, GRAD_END, apply_ctk_theme,
 )
-
-# Import modernized tabs (will create these)
+from core.ui import grad_ctkimage, GradientDivider
 from modules.pdf_tools_tab_ctk import PdfToolsFrameCTk
 from modules.psd_tools_tab_ctk import PsdToolsFrameCTk
 
+FONT_TITLE = ("Segoe UI Semibold", 20)
+FONT_TAG = ("Segoe UI", 11)
+FONT_H = ("Segoe UI Semibold", 13)
+FONT = ("Segoe UI", 12)
+FONT_MONO = ("Consolas", 11)
 
-ASSETS_DIR = _HERE / "assets"
+
+def _t(key: str, fallback: str = "") -> str:
+    try:
+        val = i18n.t(key)
+        return val if val and val != key else (fallback or key)
+    except Exception:
+        return fallback or key
 
 
-# ===========================================================================
-# Modern Log Panel with Neon Accents
-# ===========================================================================
-class LogPanelCTk(ctk.CTkFrame):
-    def __init__(self, master: ctk.CTk | ctk.CTkFrame) -> None:
-        super().__init__(
-            master,
-            fg_color=BG_CARD,
-            corner_radius=16,
-            border_width=1,
-            border_color=NEON_GLOW
-        )
-        
+class LogPanel(ctk.CTkFrame):
+    def __init__(self, master):
+        super().__init__(master, fg_color=BG_CARD, corner_radius=12,
+                         border_width=1, border_color=BORDER)
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
-
-        # Header with glow effect
-        header = ctk.CTkFrame(self, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
-        header.grid_columnconfigure(0, weight=1)
-
-        self._title_lbl = ctk.CTkLabel(
-            header,
-            text=f"✨ {i18n.t('log.title')}",
-            font=("Segoe UI", 14, "bold"),
-            text_color=ACCENT_CYAN
-        )
-        self._title_lbl.grid(row=0, column=0, sticky="w")
-
-        self._clear_btn = ctk.CTkButton(
-            header,
-            text=i18n.t("log.clear"),
-            command=self.clear,
-            width=100,
-            height=28,
-            corner_radius=8,
-            fg_color=ACCENT_PURPLE,
-            hover_color="#7c3aed"
-        )
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
+        head.grid_columnconfigure(0, weight=1)
+        self._title = ctk.CTkLabel(head, text=_t("log.title", "Журнал").upper(),
+                                   font=FONT_H, text_color=TEXT_SECONDARY)
+        self._title.grid(row=0, column=0, sticky="w")
+        self._clear_btn = ctk.CTkButton(head, text=_t("log.clear", "Очистить"),
+                                        command=self.clear, width=100, height=30,
+                                        font=FONT, fg_color="transparent",
+                                        hover_color=BG_INPUT, text_color=TEXT_PRIMARY,
+                                        border_width=1, border_color=BORDER, corner_radius=8)
         self._clear_btn.grid(row=0, column=1, sticky="e")
-
-        # Textbox with custom styling
-        self._text = ctk.CTkTextbox(
-            self,
-            height=120,
-            wrap="word",
-            corner_radius=12,
-            border_width=1,
-            border_color=ACCENT_CYAN,
-            fg_color="#0f0e1a",
-            text_color=TEXT_PRIMARY,
-            font=("Consolas", 10)
-        )
-        self._text.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        self._text = ctk.CTkTextbox(self, height=140, corner_radius=8,
+                                    fg_color=BG_INPUT, border_color=BORDER, border_width=1,
+                                    text_color=TEXT_PRIMARY, font=FONT_MONO)
+        self._text.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 12))
         self._text.configure(state="disabled")
-
         i18n.subscribe(self._retranslate)
 
-    def _retranslate(self) -> None:
-        self._title_lbl.configure(text=f"✨ {i18n.t('log.title')}")
-        self._clear_btn.configure(text=i18n.t("log.clear"))
+    def _retranslate(self):
+        self._title.configure(text=_t("log.title", "Журнал").upper())
+        self._clear_btn.configure(text=_t("log.clear", "Очистить"))
 
-    def log(self, message: str, level: str = "info") -> None:
-        # Color-coded icons
-        icons = {
-            "info": ("💠", ACCENT_CYAN),
-            "warn": ("⚠️", "#f59e0b"),
-            "error": ("❌", "#ef4444"),
-            "ok": ("✅", "#10b981")
-        }
-        icon, color = icons.get(level, ("•", TEXT_PRIMARY))
-        
+    def log(self, message, level="info"):
+        prefix = {"info": "*", "warn": "!", "error": "x", "ok": "+"}.get(level, "*")
         self._text.configure(state="normal")
-        self._text.insert("end", f"{icon} {message}\n")
+        self._text.insert("end", f"  {prefix}  {message}\n")
         self._text.see("end")
         self._text.configure(state="disabled")
 
-    def clear(self) -> None:
+    def clear(self):
         self._text.configure(state="normal")
         self._text.delete("1.0", "end")
         self._text.configure(state="disabled")
 
 
-# ===========================================================================
-# Modern Settings Frame
-# ===========================================================================
-class SettingsFrameCTk(ctk.CTkFrame):
-    def __init__(self, master: ctk.CTkFrame, on_theme_change) -> None:
+class SettingsFrame(ctk.CTkFrame):
+    def __init__(self, master, on_theme_change):
         super().__init__(master, fg_color="transparent")
         self._on_theme_change = on_theme_change
+        card = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=12,
+                            border_width=1, border_color=BORDER)
+        card.pack(fill="both", expand=True)
+        card.grid_columnconfigure(1, weight=1)
+        r = 0
+        ctk.CTkLabel(card, text=_t("settings.language", "Язык"), font=FONT_H,
+                     text_color=TEXT_PRIMARY).grid(row=r, column=0, sticky="w", padx=20, pady=(20, 6))
+        self._lang = ctk.CTkOptionMenu(card, values=["ru", "en"], command=self._apply_lang,
+                                       width=140, fg_color=BG_INPUT, button_color=ACCENT_CYAN,
+                                       button_hover_color=ACCENT_CYAN_HOVER, corner_radius=8)
+        self._lang.set(config.get("language", "ru"))
+        self._lang.grid(row=r, column=1, sticky="w", padx=6, pady=(20, 6)); r += 1
+        ctk.CTkLabel(card, text=_t("settings.theme", "Тема"), font=FONT_H,
+                     text_color=TEXT_PRIMARY).grid(row=r, column=0, sticky="w", padx=20, pady=6)
+        self._theme = ctk.CTkOptionMenu(card, values=["dark", "light", "system"],
+                                        command=self._apply_theme, width=140, fg_color=BG_INPUT,
+                                        button_color=ACCENT_CYAN, button_hover_color=ACCENT_CYAN_HOVER,
+                                        corner_radius=8)
+        self._theme.set(config.get("theme", "dark"))
+        self._theme.grid(row=r, column=1, sticky="w", padx=6, pady=6); r += 1
+        ctk.CTkLabel(card, text=_t("settings.paths", "Папки по умолчанию"), font=FONT_H,
+                     text_color=TEXT_SECONDARY).grid(row=r, column=0, columnspan=3, sticky="w",
+                                                     padx=20, pady=(18, 8)); r += 1
+        self._row_path(card, _t("settings.pdf_dir", "PDF:"), "pdf_last_dir", r); r += 1
+        self._row_path(card, _t("settings.psd_in", "PSD (вход):"), "psd_in_dir", r); r += 1
+        self._row_path(card, _t("settings.psd_out", "PSD (выход):"), "psd_out_dir", r); r += 1
+        ctk.CTkLabel(card, text=_t("settings.depth", "Глубина Smart Object"), font=FONT_H,
+                     text_color=TEXT_PRIMARY).grid(row=r, column=0, sticky="w", padx=20, pady=(18, 20))
+        self._depth = ctk.CTkOptionMenu(card, values=[str(i) for i in range(1, 11)],
+                                        command=self._apply_depth, width=90, fg_color=BG_INPUT,
+                                        button_color=ACCENT_CYAN, button_hover_color=ACCENT_CYAN_HOVER,
+                                        corner_radius=8)
+        self._depth.set(str(config.get("smart_object_depth", 3)))
+        self._depth.grid(row=r, column=1, sticky="w", padx=6, pady=(18, 20))
 
-        self._lang_var = ctk.StringVar(value=config.get("language"))
-        self._theme_var = ctk.StringVar(value=config.get("theme"))
-        self._depth_var = ctk.IntVar(value=int(config.get("smart_object_depth", 3)))
-        self._pdf_dir_var = ctk.StringVar(value=config.get("pdf_last_dir"))
-        self._psd_in_var = ctk.StringVar(value=config.get("psd_in_dir"))
-        self._psd_out_var = ctk.StringVar(value=config.get("psd_out_dir"))
-
-        self._build()
-        i18n.subscribe(self._retranslate)
-
-    def _build(self) -> None:
-        # Container with padding
-        container = ctk.CTkFrame(
-            self,
-            fg_color=BG_CARD,
-            corner_radius=16,
-            border_width=1,
-            border_color=NEON_GLOW
-        )
-        container.pack(fill="both", expand=True, padx=20, pady=20)
-        container.grid_columnconfigure(1, weight=1)
-
-        row = 0
-
-        # Language section
-        self._lbl_lang = ctk.CTkLabel(
-            container,
-            text=f"🌐 {i18n.t('settings.language')}",
-            font=("Segoe UI", 14, "bold"),
-            text_color=ACCENT_CYAN
-        )
-        self._lbl_lang.grid(row=row, column=0, sticky="w", padx=20, pady=(20, 8))
-        
-        self._lang_combo = ctk.CTkComboBox(
-            container,
-            variable=self._lang_var,
-            values=["ru", "en"],
-            state="readonly",
-            width=150,
-            corner_radius=8,
-            command=lambda _: self._apply_lang()
-        )
-        self._lang_combo.grid(row=row, column=1, sticky="w", padx=20, pady=(20, 8))
-        row += 1
-
-        # Theme section
-        self._lbl_theme = ctk.CTkLabel(
-            container,
-            text=f"🎨 {i18n.t('settings.theme')}",
-            font=("Segoe UI", 14, "bold"),
-            text_color=ACCENT_PURPLE
-        )
-        self._lbl_theme.grid(row=row, column=0, sticky="w", padx=20, pady=(16, 8))
-        
-        self._theme_combo = ctk.CTkComboBox(
-            container,
-            variable=self._theme_var,
-            values=["system", "light", "dark"],
-            state="readonly",
-            width=150,
-            corner_radius=8,
-            command=lambda _: self._apply_theme()
-        )
-        self._theme_combo.grid(row=row, column=1, sticky="w", padx=20, pady=(16, 8))
-        row += 1
-
-        # Paths section
-        ctk.CTkLabel(
-            container,
-            text="",
-            height=1
-        ).grid(row=row, column=0, pady=10)
-        row += 1
-
-        self._lbl_paths = ctk.CTkLabel(
-            container,
-            text=f"📁 {i18n.t('settings.paths')}",
-            font=("Segoe UI", 14, "bold"),
-            text_color=ACCENT_CYAN
-        )
-        self._lbl_paths.grid(row=row, column=0, columnspan=3, sticky="w", padx=20, pady=(8, 12))
-        row += 1
-
-        # Path rows
-        self._row_path(container, "settings.pdf_dir", self._pdf_dir_var, row, "pdf_last_dir")
-        row += 1
-        self._row_path(container, "settings.psd_in", self._psd_in_var, row, "psd_in_dir")
-        row += 1
-        self._row_path(container, "settings.psd_out", self._psd_out_var, row, "psd_out_dir")
-        row += 1
-
-        # Depth setting
-        ctk.CTkLabel(
-            container,
-            text="",
-            height=1
-        ).grid(row=row, column=0, pady=10)
-        row += 1
-
-        self._lbl_depth = ctk.CTkLabel(
-            container,
-            text=f"🔢 {i18n.t('settings.depth')}",
-            font=("Segoe UI", 14, "bold"),
-            text_color=ACCENT_PURPLE
-        )
-        self._lbl_depth.grid(row=row, column=0, sticky="w", padx=20, pady=(8, 8))
-        
-        depth_entry = ctk.CTkEntry(
-            container,
-            textvariable=self._depth_var,
-            width=80,
-            corner_radius=8
-        )
-        depth_entry.grid(row=row, column=1, sticky="w", padx=20, pady=(8, 8))
-        self._depth_var.trace_add("write", lambda *_: self._apply_depth())
-
-    def _row_path(self, parent, key: str, var: ctk.StringVar, row: int, cfg_key: str) -> None:
-        lbl = ctk.CTkLabel(parent, text=i18n.t(key), text_color=TEXT_SECONDARY)
-        lbl.grid(row=row, column=0, sticky="w", padx=20, pady=6)
-        
-        entry = ctk.CTkEntry(parent, textvariable=var, corner_radius=8)
-        entry.grid(row=row, column=1, sticky="ew", padx=20, pady=6)
-        
-        btn = ctk.CTkButton(
-            parent,
-            text=i18n.t("common.browse"),
-            command=lambda: self._pick_dir(var, cfg_key),
-            width=100,
-            corner_radius=8,
-            fg_color=ACCENT_PURPLE
-        )
-        btn.grid(row=row, column=2, sticky="w", padx=(8, 20), pady=6)
+    def _row_path(self, card, label, cfg_key, row):
+        ctk.CTkLabel(card, text=label, font=FONT, text_color=TEXT_PRIMARY).grid(
+            row=row, column=0, sticky="w", padx=20, pady=4)
+        var = ctk.StringVar(value=config.get(cfg_key) or "")
         var.trace_add("write", lambda *_: config.set(cfg_key, var.get()))
-        
-        setattr(self, f"_lbl_{cfg_key}", lbl)
-        setattr(self, f"_btn_{cfg_key}", btn)
+        ctk.CTkEntry(card, textvariable=var, fg_color=BG_INPUT, border_color=BORDER,
+                     corner_radius=8, height=34).grid(row=row, column=1, sticky="ew", padx=6, pady=4)
 
-    def _pick_dir(self, var: ctk.StringVar, cfg_key: str) -> None:
-        chosen = filedialog.askdirectory(initialdir=var.get() or str(Path.home()))
-        if chosen:
-            var.set(chosen)
-            config.set(cfg_key, chosen)
+        def pick():
+            chosen = filedialog.askdirectory(initialdir=var.get() or str(Path.home()))
+            if chosen:
+                var.set(chosen)
+        ctk.CTkButton(card, text=_t("common.browse", "Обзор..."), command=pick, width=100,
+                      height=34, fg_color="transparent", hover_color=BG_INPUT, text_color=TEXT_PRIMARY,
+                      border_width=1, border_color=BORDER, corner_radius=8).grid(
+            row=row, column=2, sticky="w", padx=(6, 20), pady=4)
 
-    def _apply_lang(self) -> None:
-        lang = self._lang_var.get()
-        config.set("language", lang)
-        i18n.set_language(lang)
+    def _apply_lang(self, value):
+        config.set("language", value); i18n.set_language(value)
 
-    def _apply_theme(self) -> None:
-        mode = self._theme_var.get()
-        config.set("theme", mode)
-        self._on_theme_change(mode)
+    def _apply_theme(self, value):
+        config.set("theme", value); self._on_theme_change(value)
 
-    def _apply_depth(self) -> None:
-        try:
-            config.set("smart_object_depth", int(self._depth_var.get()))
-        except (ValueError, Exception):
-            pass
-
-    def _retranslate(self) -> None:
-        self._lbl_lang.configure(text=f"🌐 {i18n.t('settings.language')}")
-        self._lbl_theme.configure(text=f"🎨 {i18n.t('settings.theme')}")
-        self._lbl_paths.configure(text=f"📁 {i18n.t('settings.paths')}")
-        self._lbl_depth.configure(text=f"🔢 {i18n.t('settings.depth')}")
-        
-        for cfg_key in ("pdf_last_dir", "psd_in_dir", "psd_out_dir"):
-            getattr(self, f"_btn_{cfg_key}").configure(text=i18n.t("common.browse"))
+    def _apply_depth(self, value):
+        config.set("smart_object_depth", int(value))
 
 
-# ===========================================================================
-# Modern About Frame
-# ===========================================================================
-class AboutFrameCTk(ctk.CTkFrame):
-    def __init__(self, master: ctk.CTkFrame) -> None:
+class AboutFrame(ctk.CTkFrame):
+    def __init__(self, master):
         super().__init__(master, fg_color="transparent")
-        
-        container = ctk.CTkFrame(
-            self,
-            fg_color=BG_CARD,
-            corner_radius=16,
-            border_width=1,
-            border_color=NEON_GLOW
-        )
-        container.pack(fill="both", expand=True, padx=32, pady=32)
-        container.grid_columnconfigure(0, weight=1)
-
-        # Title with gradient effect (simulated)
-        self._title = ctk.CTkLabel(
-            container,
-            text=f"◆ {__app_name__}",
-            font=("Segoe UI", 32, "bold"),
-            text_color=ACCENT_CYAN
-        )
-        self._title.grid(row=0, column=0, sticky="w", padx=32, pady=(32, 4))
-
-        self._tagline = ctk.CTkLabel(
-            container,
-            text=i18n.t("app.tagline"),
-            font=("Segoe UI", 14),
-            text_color=TEXT_SECONDARY
-        )
-        self._tagline.grid(row=1, column=0, sticky="w", padx=32, pady=(4, 24))
-
-        # Info section
-        self._version_lbl = ctk.CTkLabel(
-            container,
-            text=f"🔖 {i18n.t('about.version')}: {__version__}",
-            font=("Segoe UI", 12),
-            text_color=TEXT_PRIMARY
-        )
-        self._version_lbl.grid(row=2, column=0, sticky="w", padx=32, pady=4)
-
-        self._author_lbl = ctk.CTkLabel(
-            container,
-            text=f"👤 {i18n.t('about.author')}: {__author__}",
-            font=("Segoe UI", 12),
-            text_color=TEXT_PRIMARY
-        )
-        self._author_lbl.grid(row=3, column=0, sticky="w", padx=32, pady=4)
-
-        # Description
-        self._desc = ctk.CTkLabel(
-            container,
-            text=i18n.t("about.description"),
-            font=("Segoe UI", 11),
-            text_color=TEXT_SECONDARY,
-            justify="left",
-            wraplength=640
-        )
-        self._desc.grid(row=4, column=0, sticky="w", padx=32, pady=(24, 16))
-
-        # Tech stack
-        self._tech_lbl = ctk.CTkLabel(
-            container,
-            text=f"⚙️ {i18n.t('about.tech')}: Python · CustomTkinter · PyMuPDF · Pillow · pywin32",
-            font=("Segoe UI", 10),
-            text_color=ACCENT_PURPLE
-        )
-        self._tech_lbl.grid(row=5, column=0, sticky="w", padx=32, pady=(16, 32))
-
-        i18n.subscribe(self._retranslate)
-
-    def _retranslate(self) -> None:
-        self._tagline.configure(text=i18n.t("app.tagline"))
-        self._version_lbl.configure(text=f"🔖 {i18n.t('about.version')}: {__version__}")
-        self._author_lbl.configure(text=f"👤 {i18n.t('about.author')}: {__author__}")
-        self._desc.configure(text=i18n.t("about.description"))
-        self._tech_lbl.configure(
-            text=f"⚙️ {i18n.t('about.tech')}: Python · CustomTkinter · PyMuPDF · Pillow · pywin32"
-        )
+        card = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=12,
+                            border_width=1, border_color=BORDER)
+        card.pack(fill="both", expand=True)
+        ctk.CTkLabel(card, text=__app_name__, font=("Segoe UI Semibold", 24),
+                     text_color=ACCENT_CYAN).pack(anchor="w", padx=24, pady=(24, 4))
+        ctk.CTkLabel(card, text=f"Версия {__version__}", font=FONT,
+                     text_color=TEXT_SECONDARY).pack(anchor="w", padx=24, pady=2)
+        ctk.CTkLabel(card, text=f"Автор: {__author__}", font=FONT,
+                     text_color=TEXT_SECONDARY).pack(anchor="w", padx=24, pady=2)
+        ctk.CTkLabel(card, text="Работа с PDF и PSD в одном окне.", font=FONT,
+                     text_color=TEXT_MUTED).pack(anchor="w", padx=24, pady=(14, 24))
 
 
-# ===========================================================================
-# Main Application Window
-# ===========================================================================
-class MainAppCTk:
-    def __init__(self, root: ctk.CTk) -> None:
+class MainApp:
+    def __init__(self, root: ctk.CTk):
         self.root = root
-        i18n.set_language(config.get("language", "ru"))
-
-        # Apply custom theme
-        apply_ctk_theme()
-
-        root.title(f"{__app_name__} · v{__version__}")
-        root.geometry(config.get("window_geometry", "1280x820"))
-        root.minsize(1100, 700)
-
-        # Set icon
-        icon_path = ASSETS_DIR / "icon.ico"
-        if icon_path.exists():
-            try:
-                root.iconbitmap(default=str(icon_path))
-            except Exception:
-                pass
-
+        apply_ctk_theme(root, mode=config.get("theme", "dark"))
+        root.title(f"{__app_name__} - v{__version__}")
+        try:
+            root.geometry(config.get("window_geometry") or "1200x820")
+        except Exception:
+            root.geometry("1200x820")
+        root.minsize(980, 640)
+        root.configure(fg_color=BG_MAIN)
         root.grid_columnconfigure(0, weight=1)
-        root.grid_rowconfigure(1, weight=1)
+        root.grid_rowconfigure(3, weight=1)
 
-        self._build_top_bar()
-        self._build_tabview()
+        self._build_header()
+        self._build_nav()
+        self._build_content()
         self._build_log()
-        self._build_status_bar()
+        self._build_status()
 
         i18n.subscribe(self._retranslate)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _build_top_bar(self) -> None:
-        """Modern gradient-style top bar."""
-        bar = ctk.CTkFrame(
-            self.root,
-            fg_color=BG_CARD,
-            corner_radius=0,
-            border_width=0,
-            height=80
-        )
-        bar.grid(row=0, column=0, sticky="ew")
-        bar.grid_columnconfigure(1, weight=1)
-        bar.grid_propagate(False)
+    def _build_header(self):
+        header = ctk.CTkFrame(self.root, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 6))
+        header.grid_columnconfigure(1, weight=1)
 
-        # Brand with glow effect
-        self._brand = ctk.CTkLabel(
-            bar,
-            text=f"◆  {__app_name__}",
-            font=("Segoe UI", 20, "bold"),
-            text_color=ACCENT_CYAN
-        )
-        self._brand.grid(row=0, column=0, sticky="w", padx=24, pady=(16, 4))
+        logo = ctk.CTkLabel(header, text="P", font=("Segoe UI Black", 22),
+                            text_color="#ffffff", width=46, height=46)
+        img = grad_ctkimage(46, 46, GRAD_START, GRAD_END, radius=13)
+        if img:
+            logo.configure(image=img, compound="center")
+            logo._grad = img
+        logo.grid(row=0, column=0, rowspan=2, padx=(0, 14))
 
-        self._tagline = ctk.CTkLabel(
-            bar,
-            text=i18n.t("app.tagline"),
-            font=("Segoe UI", 11),
-            text_color=TEXT_SECONDARY
-        )
-        self._tagline.grid(row=1, column=0, sticky="w", padx=24, pady=(0, 16))
+        ctk.CTkLabel(header, text=__app_name__, font=FONT_TITLE,
+                     text_color=ACCENT_CYAN).grid(row=0, column=1, sticky="sw")
+        self._tag = ctk.CTkLabel(header, text=_t("app.tagline", "PDF + PSD в одном окне"),
+                                 font=FONT_TAG, text_color=TEXT_MUTED)
+        self._tag.grid(row=1, column=1, sticky="nw")
 
-        # Language selector
-        right = ctk.CTkFrame(bar, fg_color="transparent")
-        right.grid(row=0, column=2, rowspan=2, sticky="e", padx=24)
-
-        self._lang_lbl = ctk.CTkLabel(
-            right,
-            text=f"🌐 {i18n.t('lang.label')}",
-            text_color=TEXT_SECONDARY
-        )
+        lang_box = ctk.CTkFrame(header, fg_color="transparent")
+        lang_box.grid(row=0, column=2, rowspan=2, sticky="e")
+        self._lang_lbl = ctk.CTkLabel(lang_box, text=_t("lang.label", "Язык:"),
+                                      font=FONT, text_color=TEXT_SECONDARY)
         self._lang_lbl.pack(side="left", padx=(0, 8))
+        self._lang = ctk.CTkOptionMenu(lang_box, values=["ru", "en"], command=self._on_lang,
+                                       width=90, fg_color=BG_INPUT, button_color=ACCENT_CYAN,
+                                       button_hover_color=ACCENT_CYAN_HOVER, corner_radius=8)
+        self._lang.set(config.get("language", "ru"))
+        self._lang.pack(side="left")
 
-        self._lang_var = ctk.StringVar(value=config.get("language", "ru"))
-        self._lang_combo = ctk.CTkComboBox(
-            right,
-            variable=self._lang_var,
-            values=["ru", "en"],
-            state="readonly",
-            width=100,
-            corner_radius=8,
-            command=self._on_lang_change
-        )
-        self._lang_combo.pack(side="left")
+        GradientDivider(self.root, GRAD_START, GRAD_END, height=3).grid(
+            row=1, column=0, sticky="ew", padx=18, pady=(2, 0))
 
-    def _build_tabview(self) -> None:
-        """Modern tabview with glow effects."""
-        # Create main container
-        self.tab_container = ctk.CTkFrame(self.root, fg_color="transparent")
-        self.tab_container.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 12))
-        self.tab_container.grid_columnconfigure(0, weight=1)
-        self.tab_container.grid_rowconfigure(0, weight=1)
+    def _build_nav(self):
+        self._tabs = {
+            _t("tab.pdf", "PDF Tools"): "pdf",
+            _t("tab.psd", "PSD Tools"): "psd",
+            _t("tab.settings", "Настройки"): "settings",
+            _t("tab.about", "О программе"): "about",
+        }
+        bar = ctk.CTkFrame(self.root, fg_color=BG_SIDEBAR, corner_radius=12)
+        bar.grid(row=2, column=0, pady=(12, 10))
+        inner = ctk.CTkFrame(bar, fg_color="transparent")
+        inner.pack(padx=6, pady=6)
 
-        # Create tabview
-        self.tabview = ctk.CTkTabview(
-            self.tab_container,
-            corner_radius=16,
-            border_width=1,
-            border_color=NEON_GLOW,
-            fg_color=BG_CARD,
-            segmented_button_fg_color=BG_GRADIENT_START,
-            segmented_button_selected_color=ACCENT_CYAN,
-            segmented_button_selected_hover_color="#0891b2",
-            segmented_button_unselected_color=BG_CARD,
-            segmented_button_unselected_hover_color=ACCENT_PURPLE
-        )
-        self.tabview.grid(row=0, column=0, sticky="nsew")
+        self._nav_btns, self._nav_imgs = {}, {}
+        for label, key in self._tabs.items():
+            gimg = grad_ctkimage(160, 38, GRAD_START, GRAD_END, radius=10)
+            b = ctk.CTkButton(inner, text=label, width=160, height=38, corner_radius=10,
+                              font=FONT_H, fg_color="transparent", hover_color=BG_INPUT,
+                              text_color=TEXT_SECONDARY, border_width=0,
+                              command=lambda l=label: self._select(l))
+            b.pack(side="left", padx=4)
+            self._nav_btns[key] = b
+            self._nav_imgs[key] = gimg
 
-        # Add tabs
-        self.tabview.add(i18n.t("tab.pdf"))
-        self.tabview.add(i18n.t("tab.psd"))
-        self.tabview.add(i18n.t("tab.settings"))
-        self.tabview.add(i18n.t("tab.about"))
+    def _build_content(self):
+        self._content = ctk.CTkFrame(self.root, fg_color="transparent")
+        self._content.grid(row=3, column=0, sticky="nsew", padx=18)
+        self._content.grid_columnconfigure(0, weight=1)
+        self._content.grid_rowconfigure(0, weight=1)
+        self._frames = {}
 
-        # Log callback
-        def _log(msg: str, level: str = "info") -> None:
+        def _log(msg, level="info"):
             self.log_panel.log(msg, level)
+        self._log_fn = _log
 
-        # Create tab content
-        self.pdf_tab = PdfToolsFrameCTk(self.tabview.tab(i18n.t("tab.pdf")), log=_log)
-        self.psd_tab = PsdToolsFrameCTk(self.tabview.tab(i18n.t("tab.psd")), log=_log)
-        self.settings_tab = SettingsFrameCTk(
-            self.tabview.tab(i18n.t("tab.settings")),
-            on_theme_change=self._change_theme
-        )
-        self.about_tab = AboutFrameCTk(self.tabview.tab(i18n.t("tab.about")))
+    def _build_log(self):
+        self.log_panel = LogPanel(self.root)
+        self.log_panel.grid(row=4, column=0, sticky="ew", padx=18, pady=(10, 6))
+        self._frames["pdf"] = PdfToolsFrameCTk(self._content, log=self._log_fn)
+        self._frames["psd"] = PsdToolsFrameCTk(self._content, log=self._log_fn)
+        self._frames["settings"] = SettingsFrame(self._content, on_theme_change=self._change_theme)
+        self._frames["about"] = AboutFrame(self._content)
+        for f in self._frames.values():
+            f.grid(row=0, column=0, sticky="nsew")
+        self._select(list(self._tabs.keys())[0])
 
-        # Pack tab contents
-        self.pdf_tab.pack(fill="both", expand=True)
-        self.psd_tab.pack(fill="both", expand=True)
-        self.settings_tab.pack(fill="both", expand=True)
-        self.about_tab.pack(fill="both", expand=True)
+    def _build_status(self):
+        bar = ctk.CTkFrame(self.root, fg_color="transparent")
+        bar.grid(row=5, column=0, sticky="ew", padx=20, pady=(0, 8))
+        self._status = ctk.CTkLabel(bar, text=_t("status.ready", "Готово"),
+                                    font=FONT, text_color=TEXT_MUTED)
+        self._status.pack(side="left")
 
-    def _build_log(self) -> None:
-        """Modern log panel with neon styling."""
-        self.log_panel = LogPanelCTk(self.root)
-        self.log_panel.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
+    def _select(self, label):
+        key = self._tabs.get(label, "pdf")
+        for k, b in self._nav_btns.items():
+            if k == key:
+                b.configure(image=self._nav_imgs[k], compound="center", text_color="#ffffff")
+            else:
+                b.configure(image=None, text_color=TEXT_SECONDARY)
+        frame = self._frames.get(key)
+        if frame:
+            frame.tkraise()
 
-    def _build_status_bar(self) -> None:
-        """Modern status bar."""
-        self._status_var = ctk.StringVar(value=i18n.t("status.ready"))
-        bar = ctk.CTkFrame(
-            self.root,
-            fg_color=BG_CARD,
-            corner_radius=0,
-            height=32
-        )
-        bar.grid(row=3, column=0, sticky="ew")
-        bar.grid_columnconfigure(0, weight=1)
-        bar.grid_propagate(False)
+    def _on_lang(self, value):
+        config.set("language", value); i18n.set_language(value)
 
-        self._status_lbl = ctk.CTkLabel(
-            bar,
-            textvariable=self._status_var,
-            text_color=TEXT_SECONDARY,
-            font=("Segoe UI", 10)
-        )
-        self._status_lbl.grid(row=0, column=0, sticky="w", padx=16)
+    def _change_theme(self, mode):
+        apply_ctk_theme(self.root, mode=mode)
 
-    def _on_lang_change(self, _event=None) -> None:
-        lang = self._lang_var.get()
-        config.set("language", lang)
-        i18n.set_language(lang)
+    def _retranslate(self):
+        self._tag.configure(text=_t("app.tagline", "PDF + PSD в одном окне"))
+        self._lang_lbl.configure(text=_t("lang.label", "Язык:"))
+        self._status.configure(text=_t("status.ready", "Готово"))
 
-    def _change_theme(self, mode: str) -> None:
-        # CustomTkinter handles theme changes
-        if mode == "dark":
-            ctk.set_appearance_mode("dark")
-        elif mode == "light":
-            ctk.set_appearance_mode("light")
-        else:
-            ctk.set_appearance_mode("system")
-
-    def _retranslate(self) -> None:
-        self._tagline.configure(text=i18n.t("app.tagline"))
-        self._lang_lbl.configure(text=f"🌐 {i18n.t('lang.label')}")
-        self._status_var.set(i18n.t("status.ready"))
-        
-        # Update tab names (note: CTkTabview doesn't support dynamic renaming easily)
-        # Would need to recreate tabs - skipping for now
-
-    def _on_close(self) -> None:
+    def _on_close(self):
         try:
             config.set("window_geometry", self.root.geometry())
         finally:
             self.root.destroy()
 
 
-def main() -> None:
-    # Set CustomTkinter appearance
-    ctk.set_appearance_mode("dark")
-    ctk.set_default_color_theme("blue")
-    
+def main():
     root = ctk.CTk()
-    root.configure(fg_color=BG_GRADIENT_START)
-    
-    MainAppCTk(root)
+    MainApp(root)
     root.mainloop()
 
 
