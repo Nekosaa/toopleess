@@ -11,7 +11,7 @@ from core.config import config
 from core.i18n import i18n
 
 # ===== Импорт модуля умной подмены =====
-from modules.image_replace import resize_with_mode
+from modules.image_replace import resize_with_mode, prepare_for_smart_object
 from modules.so_picker import SOPickerWindow
 try:
     from PIL import Image, ImageFilter
@@ -22,10 +22,8 @@ except ImportError:
 
 LogFn = Callable[[str, str], None]
 
-
 def _is_windows() -> bool:
     return sys.platform.startswith("win")
-
 
 # ---------------------------------------------------------------------------
 # Layer-type helpers
@@ -49,7 +47,6 @@ def _is_group(layer) -> bool:
     except Exception:
         return True
 
-
 def _is_smart_object(layer) -> bool:
     """LayerKind.SMARTOBJECT = 17."""
     try:
@@ -62,7 +59,6 @@ def _is_smart_object(layer) -> bool:
         return "smart" in str(getattr(layer, "Typename", "")).lower()
     except Exception:
         return False
-
 
 class PhotoshopBridge:
     """Wrapper around Photoshop COM."""
@@ -128,7 +124,6 @@ class PhotoshopBridge:
         self.available = False
         self._init_error = "Photoshop COM session lost"
 
-
 class PsdToolsFrame(ttk.Frame):
     # Ключевые слова для автопоиска слоя с фото
     _PHOTO_KEYWORDS = (
@@ -191,7 +186,7 @@ class PsdToolsFrame(ttk.Frame):
         self._btn_auto = ttk.Button(toolbar, text="Авто фото", command=self.auto_replace_photo)
         self._btn_picker = ttk.Button(toolbar, text="Выбор SO", command=self.open_so_picker)
         for i, b in enumerate((self._btn_open, self._btn_scan, self._btn_unlck,
-                                self._btn_repl, self._btn_auto, self._btn_picker)):
+                               self._btn_repl, self._btn_auto, self._btn_picker)):
             b.grid(row=0, column=i, padx=(0, 6))
 
         left = ttk.Frame(self)
@@ -212,7 +207,7 @@ class PsdToolsFrame(ttk.Frame):
         right.columnconfigure(1, weight=1)
 
         self._lbl_actions = ttk.Label(right, text=i18n.t("psd.section.actions"),
-                                     font=("Segoe UI", 10, "bold"))
+                                      font=("Segoe UI", 10, "bold"))
         self._lbl_actions.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
         self._lbl_mode = ttk.Label(right, text=i18n.t("psd.mode"))
@@ -523,12 +518,14 @@ class PsdToolsFrame(ttk.Frame):
         target_height: int,
         mode: str = "fill",
         force_mode: Optional[str] = None,
+        use_padding: bool = False,
     ) -> str:
         """
+        ИСПРАВЛЕНО: добавлен use_padding для Smart Objects.
+        
         Готовит картинку под слот.
         force_mode: если задан ("fill"/"fit"/...), игнорирует режим из UI.
-                    Нужно для Smart Object, где обязателен fill под рамку,
-                    иначе появятся поля/искажения.
+        use_padding: если True, использует prepare_for_smart_object (ФИКС 2).
         """
         if not PIL_AVAILABLE:
             self._log("Pillow недоступен, пропускаем подготовку", "warn")
@@ -559,8 +556,8 @@ class PsdToolsFrame(ttk.Frame):
 
                 # Проверка на мелкий исходник
                 if (min(sw, sh) < self._MIN_SOURCE_SIDE
-                        and not no_upscale
-                        and not self._small_source_ack):
+                    and not no_upscale
+                    and not self._small_source_ack):
                     proceed = messagebox.askyesno(
                         "Мелкое фото",
                         f"Исходник {sw}×{sh}, слот {target_width}×{target_height}"
@@ -579,14 +576,17 @@ class PsdToolsFrame(ttk.Frame):
                         "warn",
                     )
 
-                # ИСПРАВЛЕНО: передаём width и height отдельно, а не tuple
-                result_img = resize_with_mode(
-                    new_img,
-                    target_width,
-                    target_height,
-                    mode=effective_mode,
-                    no_upscale=no_upscale,
-                )
+                # ФИКС 2: для SO используем prepare_for_smart_object
+                if use_padding:
+                    result_img = prepare_for_smart_object(new_img, target_width, target_height)
+                else:
+                    result_img = resize_with_mode(
+                        new_img,
+                        target_width,
+                        target_height,
+                        mode=effective_mode,
+                        no_upscale=no_upscale,
+                    )
 
                 # Sharpen при апскейле
                 if scale > 1.5 and not no_upscale:
@@ -603,7 +603,7 @@ class PsdToolsFrame(ttk.Frame):
                 self._log(
                     f"Prepare: {sw}×{sh} → {result_img.size[0]}×{result_img.size[1]} "
                     f"({effective_mode}, "
-                    f"{'no-upscale' if no_upscale else f'upscale x{scale:.1f}'})",
+                    f"{'padding' if use_padding else ('no-upscale' if no_upscale else f'upscale x{scale:.1f}')})",
                     "info",
                 )
                 return self._save_temp(result_img, new_image_path)
@@ -624,15 +624,16 @@ class PsdToolsFrame(ttk.Frame):
             return original_path
 
     # ============================================================
-    # SMART OBJECT REPLACE
+    # SMART OBJECT REPLACE (ИСПРАВЛЕНО)
     # ============================================================
 
     def _read_so_true_size(self, so_layer=None) -> Optional[tuple[float, float]]:
         """
+        ФИКС 1: Улучшенное чтение нативного размера SO.
+        
         Читает НАТИВНЫЙ размер вложенного контента SO (ключ "size").
-        Именно под него надо готовить картинку, чтобы Photoshop при
-        replaceContents воспроизвёл исходную геометрию 1:1 и не менял масштаб.
-        Если "size" недоступен — fallback на transform/nonAffine (размер на холсте).
+        Fallback 1: transform/nonAffine (размер на холсте)
+        Fallback 2: editContents (УЛУЧШЕНИЕ 5)
         """
         if so_layer is not None:
             try:
@@ -645,8 +646,8 @@ class PsdToolsFrame(ttk.Frame):
     try {
         var ref = new ActionReference();
         ref.putEnumerated(charIDToTypeID("Lyr "),
-                          charIDToTypeID("Ordn"),
-                          charIDToTypeID("Trgt"));
+                         charIDToTypeID("Ordn"),
+                         charIDToTypeID("Trgt"));
         var lyrDesc = executeActionGet(ref);
 
         if (!lyrDesc.hasKey(stringIDToTypeID("smartObject"))) {
@@ -670,6 +671,20 @@ class PsdToolsFrame(ttk.Frame):
                 } catch(__) {}
             }
         }
+        
+        // ФИКС 1: проверка через link (embedded/linked content)
+        if (soDesc.hasKey(stringIDToTypeID("link"))) {
+            var linkDesc = soDesc.getObjectValue(stringIDToTypeID("link"));
+            if (linkDesc.hasKey(stringIDToTypeID("size"))) {
+                var linkSize = linkDesc.getObjectValue(stringIDToTypeID("size"));
+                try {
+                    var wLink = linkSize.getUnitDoubleValue(stringIDToTypeID("width"));
+                    var hLink = linkSize.getUnitDoubleValue(stringIDToTypeID("height"));
+                    if (wLink > 0 && hLink > 0) return wLink.toFixed(3)+"|"+hLink.toFixed(3)+"|link";
+                } catch(_) {}
+            }
+        }
+        
         // 2) fallback: размер на холсте (может дать неверный масштаб при перспективе)
         if (soDesc.hasKey(stringIDToTypeID("transform"))) {
             var t = soDesc.getList(stringIDToTypeID("transform"));
@@ -691,8 +706,9 @@ class PsdToolsFrame(ttk.Frame):
             result = self._ps.app.DoJavaScript(jsx)
             raw = str(result).strip() if result is not None else ""
             if not raw or raw.startswith("ERR"):
-                self._log(f"SO true-size: {raw or 'no result'}", "warn")
-                return None
+                self._log(f"SO true-size: {raw or 'no result'}, trying editContents fallback", "warn")
+                # УЛУЧШЕНИЕ 5: fallback через editContents
+                return self._read_so_size_via_edit_contents(so_layer)
             parts = raw.split("|")
             if len(parts) < 2:
                 return None
@@ -705,9 +721,42 @@ class PsdToolsFrame(ttk.Frame):
             self._log(f"SO true-size read failed: {e}", "warn")
         return None
 
+    def _read_so_size_via_edit_contents(self, so_layer) -> Optional[tuple[float, float]]:
+        """
+        УЛУЧШЕНИЕ 5: Fallback для edge cases.
+        Открывает SO и читает точный размер контента через document dimensions.
+        """
+        jsx = r"""
+(function() {
+    try {
+        executeAction(stringIDToTypeID("placedLayerEditContents"), 
+                     new ActionDescriptor(), DialogModes.NO);
+        var w = app.activeDocument.width.as('px');
+        var h = app.activeDocument.height.as('px');
+        app.activeDocument.close(SaveOptions.DONOTSAVECHANGES);
+        return w + "|" + h;
+    } catch(e) {
+        return "ERR:" + e.message;
+    }
+})();
+"""
+        try:
+            if so_layer:
+                self._doc.ActiveLayer = so_layer
+            result = self._ps.app.DoJavaScript(jsx)
+            if not result.startswith("ERR"):
+                parts = result.split("|")
+                w = float(parts[0])
+                h = float(parts[1])
+                self._log(f"SO size via editContents: {w:.0f}x{h:.0f}px", "info")
+                return (w, h)
+        except Exception as e:
+            self._log(f"Edit contents fallback failed: {e}", "error")
+        return None
+
     def _replace_smart_object(self, so_layer, image_path: str, mode: str,
-                              frame_key: Optional[str] = None,
-                              isolate: bool = False) -> None:
+                             frame_key: Optional[str] = None,
+                             isolate: bool = False) -> None:
         self._doc.ActiveLayer = so_layer
 
         fw = fh = 0
@@ -732,14 +781,11 @@ class PsdToolsFrame(ttk.Frame):
                 self._log(f"SO bounds read failed: {e}", "warn")
                 fw = fh = 0
 
-        # ВАЖНО (ФИКС): картинку готовим строго под НАТИВНЫЙ размер контента SO
-        # в режиме FILL. Тогда соотношение сторон совпадёт с контентом, а
-        # Photoshop при замене контента сам сохранит трансформацию контейнера
-        # (перспектива/наклон/поворот), маску и стили слоя.
+        # ФИКС 2: используем prepare_for_smart_object (padding mode)
         prepared_path = image_path
         if PIL_AVAILABLE and fw > 0 and fh > 0:
             prepared_path = self._prepare_image_for_psd(
-                image_path, fw, fh, mode="fill", force_mode="fill"
+                image_path, fw, fh, mode="fill", force_mode="fill", use_padding=True
             )
 
         stored = self._so_frames.get(frame_key) if frame_key else None
@@ -754,12 +800,11 @@ class PsdToolsFrame(ttk.Frame):
     def _run_so_replace_contents_jsx(self, image_path: str, mode: str,
                                      frame_literal: str, isolate: bool = False):
         """
+        ФИКС 3: Добавлена проверка correspondence после замены.
+        
         Замена контента Smart Object.
         Photoshop САМ сохраняет трансформацию контейнера (перспектива/наклон/
-        поворот), маску слоя и стили (fx). Никаких ручных трансформаций больше
-        НЕ делаем — именно они ломали геометрию (двойной warp / схлопывание).
-        Картинка заранее подготовлена под НАТИВНЫЙ размер контента SO.
-        readSOQuad здесь используется ТОЛЬКО для логирования.
+        поворот), маску слоя и стили (fx).
         """
         path_literal = json.dumps(str(Path(image_path)))
         isolate_literal = "true" if isolate else "false"
@@ -767,26 +812,26 @@ class PsdToolsFrame(ttk.Frame):
         jsx = r"""
 (function () {
     var NEW_PATH = __PATH__;
-    var ISOLATE  = __ISOLATE__;
+    var ISOLATE = __ISOLATE__;
 
     var doc = app.activeDocument;
 
     var savedRulerUnits = app.preferences.rulerUnits;
-    var savedTypeUnits  = app.preferences.typeUnits;
+    var savedTypeUnits = app.preferences.typeUnits;
     app.preferences.rulerUnits = Units.PIXELS;
-    app.preferences.typeUnits  = TypeUnits.PIXELS;
+    app.preferences.typeUnits = TypeUnits.PIXELS;
 
     function dist(x1,y1,x2,y2){var dx=x2-x1,dy=y2-y1;return Math.sqrt(dx*dx+dy*dy);}
 
     function readSOQuad() {
         var o = { ok:false, angle:0, flipped:false, hasSkew:false,
-                  tl_x:0, tl_y:0, tr_x:0, tr_y:0, br_x:0, br_y:0, bl_x:0, bl_y:0,
-                  w:0, h:0 };
+                 tl_x:0, tl_y:0, tr_x:0, tr_y:0, br_x:0, br_y:0, bl_x:0, bl_y:0,
+                 w:0, h:0 };
         try {
             var ref = new ActionReference();
             ref.putEnumerated(charIDToTypeID("Lyr "),
-                              charIDToTypeID("Ordn"),
-                              charIDToTypeID("Trgt"));
+                            charIDToTypeID("Ordn"),
+                            charIDToTypeID("Trgt"));
             var lyrDesc = executeActionGet(ref);
             var soDesc = lyrDesc.getObjectValue(stringIDToTypeID("smartObject"));
             var t = soDesc.getList(stringIDToTypeID("transform"));
@@ -819,26 +864,42 @@ class PsdToolsFrame(ttk.Frame):
         try { doc.selection.deselect(); } catch(_) {}
         try {
             executeAction(stringIDToTypeID("placedLayerNewViaCopy"),
-                          undefined, DialogModes.NO);
+                         undefined, DialogModes.NO);
             isolateStatus = "ok";
         } catch(e) {
             isolateStatus = "FAILED:" + ((e && e.message) ? e.message : String(e));
         }
     }
 
-    // ЕДИНСТВЕННОЕ действие: заменить контент.
-    // Трансформация контейнера, маска и стили сохраняются Photoshop автоматически.
+    // ЕДИНСТВЕННОЕ действие: заменить контент
     var d0 = new ActionDescriptor();
     d0.putPath(charIDToTypeID('null'), new File(NEW_PATH));
     try { d0.putInteger(charIDToTypeID('PgNm'), 1); } catch(e) {}
     executeAction(stringIDToTypeID('placedLayerReplaceContents'), d0, DialogModes.NO);
 
+    // ФИКС 3: проверка correspondence после замены
+    var after = readSOQuad();
+    var finalW = 0, finalH = 0;
+    try {
+        var refAfter = new ActionReference();
+        refAfter.putEnumerated(charIDToTypeID("Lyr "),
+                              charIDToTypeID("Ordn"),
+                              charIDToTypeID("Trgt"));
+        var lyrDescAfter = executeActionGet(refAfter);
+        var soDescAfter = lyrDescAfter.getObjectValue(stringIDToTypeID("smartObject"));
+        if (soDescAfter.hasKey(stringIDToTypeID("size"))) {
+            var fs = soDescAfter.getObjectValue(stringIDToTypeID("size"));
+            finalW = fs.getUnitDoubleValue(stringIDToTypeID("width"));
+            finalH = fs.getUnitDoubleValue(stringIDToTypeID("height"));
+        }
+    } catch(e) {}
+
     app.preferences.rulerUnits = savedRulerUnits;
-    app.preferences.typeUnits  = savedTypeUnits;
+    app.preferences.typeUnits = savedTypeUnits;
 
     var transformed = before.ok && (before.hasSkew
-                                    || Math.abs(before.angle) > 1.0
-                                    || before.flipped);
+                                   || Math.abs(before.angle) > 1.0
+                                   || before.flipped);
     return before.tl_x + "|" + before.tl_y + "|" + before.tr_x + "|" + before.tr_y
          + "|" + before.br_x + "|" + before.br_y + "|" + before.bl_x + "|" + before.bl_y
          + "|" + before.angle.toFixed(2)
@@ -847,7 +908,8 @@ class PsdToolsFrame(ttk.Frame):
          + "|" + (transformed ? "1" : "0")
          + "|" + before.w.toFixed(1) + "|" + before.h.toFixed(1)
          + "|pure-replace"
-         + "|" + isolateStatus;
+         + "|" + isolateStatus
+         + "|finalSize:" + finalW.toFixed(0) + "x" + finalH.toFixed(0);
 })();
 """
         jsx = (jsx
@@ -863,6 +925,11 @@ class PsdToolsFrame(ttk.Frame):
                 transformed = parts[11] == "1" if len(parts) > 11 else False
                 method = parts[14] if len(parts) > 14 else "?"
                 iso_status = parts[15] if len(parts) > 15 else "skip"
+                
+                # ФИКС 3: парсим finalSize
+                final_size_str = "unknown"
+                if len(parts) > 16 and "finalSize:" in parts[16]:
+                    final_size_str = parts[16].replace("finalSize:", "")
 
                 xs = [corners[0], corners[2], corners[4], corners[6]]
                 ys = [corners[1], corners[3], corners[5], corners[7]]
@@ -874,7 +941,8 @@ class PsdToolsFrame(ttk.Frame):
                 self._log(
                     f"SO replace: {method}, "
                     f"frame {frame[2]-frame[0]:.0f}x{frame[3]-frame[1]:.0f}px, "
-                    f"{'transformed' if transformed else 'flat'}",
+                    f"{'transformed' if transformed else 'flat'}, "
+                    f"content: {final_size_str}",
                     "info",
                 )
                 return frame
@@ -887,7 +955,7 @@ class PsdToolsFrame(ttk.Frame):
     # ============================================================
 
     def _replace_layer_content(self, layer, image_path: str, mode: str,
-                               frame_key: Optional[str] = None) -> None:
+                              frame_key: Optional[str] = None) -> None:
         if _is_group(layer):
             raise RuntimeError("Selected item is a group (LayerSet), not a photo layer.")
 
@@ -1202,7 +1270,7 @@ class PsdToolsFrame(ttk.Frame):
         try:
             layer = self._resolve_layer(path)
             self._replace_layer_content(layer, image_path, self._mode_var.get(),
-                                        frame_key=json.dumps(path))
+                                       frame_key=json.dumps(path))
             self._log(f"Auto: фото подставлено в '{name}'", "ok")
         except Exception as exc:
             messagebox.showerror(i18n.t("error.title"), str(exc))
@@ -1223,7 +1291,7 @@ class PsdToolsFrame(ttk.Frame):
             return
         out_dir.mkdir(parents=True, exist_ok=True)
         images = [p for p in in_dir.iterdir()
-                  if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp")]
+                 if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp")]
         if not images:
             messagebox.showinfo(i18n.t("info.title"), "No images found in in-folder")
             return

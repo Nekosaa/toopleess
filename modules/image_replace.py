@@ -7,14 +7,13 @@ from typing import Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
-
 @dataclass
 class ImageMetadata:
     """Store image metadata for preservation"""
     dpi: Tuple[int, int] = (72, 72)
     format: str = "PNG"
     jpeg_quality: int = 95
-    
+
     @classmethod
     def from_image(cls, img: Image.Image):
         """Extract metadata from PIL Image"""
@@ -25,6 +24,59 @@ class ImageMetadata:
         )
 
 
+def prepare_for_smart_object(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    """
+    ФИКС 2: Специальный режим подготовки для SO с padding вместо crop.
+    
+    Подгоняет изображение под aspect ratio target_w:target_h БЕЗ кропа,
+    добавляет padding (прозрачный/белый) до точного размера.
+    Результат: изображение РОВНО target_w x target_h с правильным AR.
+    
+    Args:
+        img: Source PIL Image
+        target_w: Target width in pixels
+        target_h: Target height in pixels
+    
+    Returns:
+        Image with exact dimensions and correct aspect ratio (with padding if needed)
+    """
+    orig_w, orig_h = img.size
+    target_ratio = target_w / target_h
+    orig_ratio = orig_w / orig_h
+    
+    # Вписываем изображение (fit mode)
+    if orig_ratio > target_ratio:
+        # Шире → подгоняем по ширине
+        new_w = target_w
+        new_h = int(target_w / orig_ratio)
+    else:
+        # Выше → подгоняем по высоте
+        new_h = target_h
+        new_w = int(target_h * orig_ratio)
+    
+    # Resize с качественным ресемплингом
+    resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    
+    # Создаём canvas нужного размера
+    if img.mode == 'RGBA':
+        canvas = Image.new('RGBA', (target_w, target_h), (255, 255, 255, 0))
+    else:
+        canvas = Image.new('RGB', (target_w, target_h), (255, 255, 255))
+    
+    # Центрируем изображение
+    paste_x = (target_w - new_w) // 2
+    paste_y = (target_h - new_h) // 2
+    
+    if img.mode == 'RGBA':
+        canvas.paste(resized, (paste_x, paste_y), resized)
+    else:
+        canvas.paste(resized, (paste_x, paste_y))
+    
+    logger.info(f"✅ Smart Object padding: {orig_w}x{orig_h} → {new_w}x{new_h} on {target_w}x{target_h} canvas")
+    
+    return canvas
+
+
 def resize_with_mode(
     img: Image.Image,
     target_width: int,
@@ -33,23 +85,23 @@ def resize_with_mode(
     no_upscale: bool = False
 ) -> Image.Image:
     """Resize image with various modes
-    
+
     Args:
         img: Source PIL Image
         target_width: Target width in pixels
         target_height: Target height in pixels
         mode: Resize mode - 'fit', 'fill', 'cover', 'stretch'
         no_upscale: If True, never upscale (only downscale)
-    
+
     Returns:
         Resized PIL Image
     """
     orig_w, orig_h = img.size
     target_ratio = target_width / target_height
     orig_ratio = orig_w / orig_h
-    
+
     logger.info(f"Resize: {orig_w}x{orig_h} → {target_width}x{target_height} (mode={mode}, no_upscale={no_upscale})")
-    
+
     # Calculate scale factor
     if mode == "fill":
         # Fill entire frame (may crop)
@@ -66,27 +118,27 @@ def resize_with_mode(
         return img.resize((new_w, new_h), Image.LANCZOS)
     else:
         raise ValueError(f"Unknown resize mode: {mode}")
-    
+
     # Apply no_upscale constraint
     if no_upscale and scale > 1.0:
         logger.warning(f"⚠ Upscale blocked: x{scale:.2f} (no_upscale=True)")
         scale = 1.0
-    
+
     # Log upscale warning
     if scale > 2.0:
         logger.warning(f"⚠ High upscale: x{scale:.1f} - качество может снизиться")
-    
+
     # Resize with high-quality LANCZOS resampling
     new_w = int(orig_w * scale)
     new_h = int(orig_h * scale)
     resized = img.resize((new_w, new_h), Image.LANCZOS)
-    
+
     # Crop to exact target size if needed (for fill/cover modes)
     if mode in ["fill", "cover"]:
         left = (new_w - target_width) // 2
         top = (new_h - target_height) // 2
         resized = resized.crop((left, top, left + target_width, top + target_height))
-    
+
     return resized
 
 
@@ -100,7 +152,7 @@ def prepare_image_for_psd(
     force_fill: bool = False
 ) -> ImageMetadata:
     """Prepare image for PSD replacement
-    
+
     Args:
         source_path: Path to source image
         target_width: Target width in pixels
@@ -109,7 +161,7 @@ def prepare_image_for_psd(
         mode: Resize mode (ignored if force_fill=True)
         no_upscale: Prevent upscaling (ignored if force_fill=True)
         force_fill: Force fill mode with upscale (for Smart Objects)
-    
+
     Returns:
         ImageMetadata object with original metadata
     """
@@ -121,35 +173,55 @@ def prepare_image_for_psd(
     else:
         effective_mode = mode
         effective_no_upscale = no_upscale
-    
+
     # Load source image
     img = Image.open(source_path)
     metadata = ImageMetadata.from_image(img)
-    
+
     # Convert to RGB if needed
     if img.mode not in ['RGB', 'RGBA']:
         img = img.convert('RGB')
-    
+
     orig_w, orig_h = img.size
     scale = max(target_width / orig_w, target_height / orig_h) if effective_mode == "fill" else min(target_width / orig_w, target_height / orig_h)
-    
+
     # Warn about small sources
     if orig_w < 200 or orig_h < 200:
         logger.warning(f"⚠ Исходник мал: {orig_w}x{orig_h}px - рекомендуется >200px")
-    
+
     # Log upscale coefficient
     if scale > 1.0 and not effective_no_upscale:
         logger.warning(f"⚠ Upscale x{scale:.1f}: исходник {orig_w}x{orig_h} мал для {target_width}x{target_height}")
-    
+
     # Resize image
     resized = resize_with_mode(img, target_width, target_height, effective_mode, effective_no_upscale)
     
+    # УЛУЧШЕНИЕ 4: Sharpening при upscale
+    if scale > 1.3 and not effective_no_upscale:
+        try:
+            # Более агрессивный sharpen для сильного upscale
+            resized = resized.filter(
+                ImageFilter.UnsharpMask(radius=2.0, percent=140, threshold=2)
+            )
+            logger.info(f"✅ Applied aggressive sharpening (upscale x{scale:.1f})")
+        except Exception as e:
+            logger.warning(f"⚠ Sharpening failed: {e}")
+    
+    # УЛУЧШЕНИЕ 4: DPI нормализация
+    max_side = max(target_width, target_height)
+    if max_side > 2000:
+        resized.info['dpi'] = (300, 300)
+        logger.info("✅ Set DPI to 300 (high-res output)")
+    else:
+        resized.info['dpi'] = (72, 72)
+        logger.info("✅ Set DPI to 72 (web resolution)")
+
     # Save with metadata preservation
-    save_kwargs = {'dpi': metadata.dpi}
+    save_kwargs = {'dpi': resized.info.get('dpi', (72, 72))}
     if metadata.format == 'JPEG':
         save_kwargs['quality'] = metadata.jpeg_quality
-    
+
     resized.save(output_path, **save_kwargs)
     logger.info(f"✅ Saved: {output_path} ({resized.size[0]}x{resized.size[1]}px)")
-    
+
     return metadata
