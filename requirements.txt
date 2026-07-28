@@ -5,3 +5,4 @@ darkdetect>=0.8.0
 pywin32>=306; sys_platform=="win32"
 pyinstaller>=6.5.0
 psd-tools>=1.9.0
+customtkinter>=5.2.0
