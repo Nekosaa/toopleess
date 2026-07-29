@@ -1,4 +1,4 @@
-"""Градиентные UI-хелперы для Prizma Studio (Pillow -> CTkImage)."""
+"""Градиентные UI-хелперы и компоненты для Prizma Studio (Pillow -> CTkImage)."""
 from __future__ import annotations
 
 import customtkinter as ctk
@@ -48,15 +48,51 @@ class GradientDivider(ctk.CTkLabel):
         self._c1, self._c2, self._h = c1, c2, height
         self._after = None
         self._img = None
+        self._last_w = 0
         self.bind("<Configure>", self._on_cfg)
 
     def _on_cfg(self, event):
+        if event.width <= 1 or event.width == self._last_w:
+            return
+        self._last_w = event.width
         if self._after:
             self.after_cancel(self._after)
-        self._after = self.after(100, lambda w=event.width: self._draw(w))
+        # ВАЖНО: имя _render, а не _draw (последнее занято customtkinter)
+        self._after = self.after(80, lambda w=event.width: self._render(w))
 
-    def _draw(self, w: int):
+    def _render(self, w: int):
         img = grad_ctkimage(w, self._h, self._c1, self._c2, radius=0)
         if img:
             self._img = img
             self.configure(image=img)
+
+
+class NavButton(ctk.CTkButton):
+    """Пункт бокового меню: прозрачный по умолчанию, градиентная «пилюля» когда активен."""
+
+    def __init__(self, master, text: str, c1: str, c2: str,
+                 width: int = 208, height: int = 44, command=None,
+                 inactive_color: str = "#9AA0AE", hover_color: str = "#1E1F27", **kw):
+        super().__init__(
+            master, text=text, width=width, height=height, corner_radius=12,
+            fg_color="transparent", hover_color=hover_color,
+            text_color=inactive_color, font=("Segoe UI Semibold", 13),
+            command=command, **kw,
+        )
+        self._c1, self._c2 = c1, c2
+        self._w, self._h = width, height
+        self._inactive = inactive_color
+        self._img = None
+
+    def _ensure_img(self):
+        if self._img is None:
+            self._img = grad_ctkimage(self._w, self._h, self._c1, self._c2, radius=12)
+
+    def set_active(self, active: bool):
+        if active:
+            self._ensure_img()
+            if self._img is not None:
+                self.configure(image=self._img, compound="center")
+            self.configure(text_color="#FFFFFF")
+        else:
+            self.configure(image=None, text_color=self._inactive)
