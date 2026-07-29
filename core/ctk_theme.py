@@ -1,52 +1,62 @@
 """Prizma Studio - тема оформления (CustomTkinter).
 
-Профессиональный тёмный стиль: графит + единый синий/индиго акцент.
-Управляйте всем видом приложения, меняя значения в блоке ПАЛИТРА.
+Профессиональный тёмный стиль:
+  - Фон: глубокий графит с лёгким холодным подтоном
+  - Акценты: 3-цветный градиент бирюзовый -> индиго -> фиолетовый
+Меняйте только hex-значения в блоке ПАЛИТРА.
 """
 from __future__ import annotations
 
 import customtkinter as ctk
 
 # ---------------------------------------------------------------------------
-# ПАЛИТРА (меняйте только hex-значения — имена констант трогать не нужно)
+# ПАЛИТРА
 # ---------------------------------------------------------------------------
 
 # Фон и поверхности
-BG_MAIN             = "#0e1116"   # основной фон окна
-BG_GRADIENT_START   = "#12151c"   # верх шапки
-BG_GRADIENT_END     = "#0e1116"   # низ шапки
-BG_CARD             = "#171b22"   # карточки / тулбары / панели
-BG_SIDEBAR          = "#13161d"   # боковая панель
-BG_INPUT            = "#1e232c"   # поля ввода
+BG_MAIN = "#0B0E14"
+BG_GRADIENT_START = "#12151C"
+BG_GRADIENT_END = "#0B0E14"
+BG_CARD = "#161A22"
+BG_CARD_HOVER = "#1B2029"
+BG_SIDEBAR = "#0F131A"
+BG_INPUT = "#1D222C"
 
-# Границы / разделители (аккуратные, вместо яркого свечения)
-BORDER              = "#262b34"
-NEON_GLOW           = "#262b34"
+# Границы
+BORDER = "#242A35"
+BORDER_SOFT = "#1E232D"
+NEON_GLOW = "#242A35"
 
-# Акценты (бирюзовый + фиолетовый)
-ACCENT_CYAN         = "#2dd4bf"   # основной акцент (бирюзовый)
-ACCENT_CYAN_HOVER   = "#14b8a6"
-ACCENT_PURPLE       = "#8b5cf6"   # вторичный (фиолетовый)
-ACCENT_PURPLE_HOVER = "#7c3aed"
+# Акценты — 3-стоп градиент
+ACCENT_CYAN = "#2DD4BF"
+ACCENT_CYAN_HOVER = "#14B8A6"
+ACCENT_INDIGO = "#6366F1"
+ACCENT_INDIGO_HOVER = "#4F46E5"
+ACCENT_PURPLE = "#A855F7"
+ACCENT_PURPLE_HOVER = "#9333EA"
 
-# Градиент-перелив (бирюза -> фиолетовый)
-GRAD_START          = "#2dd4bf"
-GRAD_END            = "#8b5cf6"
+# Градиент-перелив: бирюза -> индиго -> фиолет
+GRAD_START = ACCENT_CYAN
+GRAD_MID = ACCENT_INDIGO
+GRAD_MIDDLE = ACCENT_INDIGO      # alias для совместимости
+GRAD_END = ACCENT_PURPLE
 
 # Текст
-TEXT_PRIMARY        = "#e6edf3"
-TEXT_SECONDARY      = "#9aa4b2"
-TEXT_MUTED          = "#6b7280"
+TEXT_PRIMARY = "#E6EDF3"
+TEXT_SECONDARY = "#A0AABA"
+TEXT_MUTED = "#6B7382"
+TEXT_DISABLED = "#4A5261"
 
 # Статусы
-SUCCESS             = "#22c55e"
-WARNING             = "#f59e0b"
-ERROR               = "#ef4444"
-INFO                = "#3b82f6"
+SUCCESS = "#22C55E"
+WARNING = "#F59E0B"
+ERROR = "#EF4444"
+INFO = "#38BDF8"
 
-# Радиусы / отступы для единообразия
-RADIUS              = 8
-RADIUS_CARD         = 12
+# Радиусы
+RADIUS = 8
+RADIUS_CARD = 12
+RADIUS_PILL = 999
 
 
 def _override_theme() -> None:
@@ -72,10 +82,10 @@ def _override_theme() -> None:
         })
 
         t["CTkButton"].update({
-            "fg_color": pair(ACCENT_CYAN),
-            "hover_color": pair(ACCENT_CYAN_HOVER),
-            "text_color": pair("#ffffff"),
-            "text_color_disabled": pair(TEXT_MUTED),
+            "fg_color": pair(ACCENT_INDIGO),
+            "hover_color": pair(ACCENT_INDIGO_HOVER),
+            "text_color": pair("#FFFFFF"),
+            "text_color_disabled": pair(TEXT_DISABLED),
             "border_color": pair(BORDER),
             "corner_radius": RADIUS,
             "border_width": 0,
@@ -99,8 +109,8 @@ def _override_theme() -> None:
             if key in t:
                 t[key].update({
                     "fg_color": pair(BG_INPUT),
-                    "button_color": pair(ACCENT_CYAN),
-                    "button_hover_color": pair(ACCENT_CYAN_HOVER),
+                    "button_color": pair(ACCENT_INDIGO),
+                    "button_hover_color": pair(ACCENT_INDIGO_HOVER),
                     "border_color": pair(BORDER),
                     "text_color": pair(TEXT_PRIMARY),
                     "corner_radius": RADIUS,
@@ -110,8 +120,8 @@ def _override_theme() -> None:
             t["CTkTabview"].update({
                 "fg_color": pair(BG_CARD),
                 "segmented_button_fg_color": pair(BG_SIDEBAR),
-                "segmented_button_selected_color": pair(ACCENT_CYAN),
-                "segmented_button_selected_hover_color": pair(ACCENT_CYAN_HOVER),
+                "segmented_button_selected_color": pair(ACCENT_INDIGO),
+                "segmented_button_selected_hover_color": pair(ACCENT_INDIGO_HOVER),
                 "segmented_button_unselected_color": pair(BG_SIDEBAR),
                 "segmented_button_unselected_hover_color": pair(BORDER),
                 "text_color": pair(TEXT_PRIMARY),
@@ -120,8 +130,8 @@ def _override_theme() -> None:
         if "CTkSegmentedButton" in t:
             t["CTkSegmentedButton"].update({
                 "fg_color": pair(BG_SIDEBAR),
-                "selected_color": pair(ACCENT_CYAN),
-                "selected_hover_color": pair(ACCENT_CYAN_HOVER),
+                "selected_color": pair(ACCENT_INDIGO),
+                "selected_hover_color": pair(ACCENT_INDIGO_HOVER),
                 "unselected_color": pair(BG_SIDEBAR),
                 "unselected_hover_color": pair(BORDER),
                 "text_color": pair(TEXT_PRIMARY),
@@ -132,19 +142,15 @@ def _override_theme() -> None:
             if key in t:
                 for ck in ("button_color", "progress_color", "fg_color"):
                     if ck in t[key]:
-                        t[key][ck] = pair(ACCENT_CYAN)
+                        t[key][ck] = pair(ACCENT_INDIGO)
                 if "button_hover_color" in t[key]:
-                    t[key]["button_hover_color"] = pair(ACCENT_CYAN_HOVER)
+                    t[key]["button_hover_color"] = pair(ACCENT_INDIGO_HOVER)
     except Exception:
-        # разные версии CustomTkinter — не падаем, применяем что смогли
         pass
 
 
 def apply_ctk_theme(root=None, mode: str = "dark", *args, **kwargs) -> None:
-    """Применяет профессиональную тему ко всему приложению.
-
-    Вызывается из main_ctk.py, безопасно принимает любые доп. аргументы.
-    """
+    """Применяет тему ко всему приложению."""
     try:
         ctk.set_appearance_mode(mode if mode in ("light", "dark", "system") else "dark")
     except Exception:
