@@ -45,7 +45,7 @@ class GradientDivider(ctk.CTkLabel):
 
     def __init__(self, master, c1: str, c2: str, height: int = 3):
         super().__init__(master, text="", height=height)
-        self._c1, self._c2, self._h = c1, c2, height
+        self._c1, self._c2, self._grad_h = c1, c2, height
         self._after = None
         self._img = None
         self._last_w = 0
@@ -61,7 +61,7 @@ class GradientDivider(ctk.CTkLabel):
         self._after = self.after(80, lambda w=event.width: self._render(w))
 
     def _render(self, w: int):
-        img = grad_ctkimage(w, self._h, self._c1, self._c2, radius=0)
+        img = grad_ctkimage(w, self._grad_h, self._c1, self._c2, radius=0)
         if img:
             self._img = img
             self.configure(image=img)
@@ -80,13 +80,13 @@ class NavButton(ctk.CTkButton):
             command=command, **kw,
         )
         self._c1, self._c2 = c1, c2
-        self._w, self._h = width, height
+        self._grad_w, self._grad_h = width, height
         self._inactive = inactive_color
         self._img = None
 
     def _ensure_img(self):
         if self._img is None:
-            self._img = grad_ctkimage(self._w, self._h, self._c1, self._c2, radius=12)
+            self._img = grad_ctkimage(self._grad_w, self._grad_h, self._c1, self._c2, radius=12)
 
     def set_active(self, active: bool):
         if active:
