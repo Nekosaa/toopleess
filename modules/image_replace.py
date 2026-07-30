@@ -26,11 +26,10 @@ class ImageMetadata:
 
 def prepare_for_smart_object(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
     """
-    ФИКС 2: Специальный режим подготовки для SO с padding вместо crop.
+    ФИКС 3: Режим COVER для Smart Objects - заполняем весь кадр с обрезкой.
     
-    Подгоняет изображение под aspect ratio target_w:target_h БЕЗ кропа,
-    добавляет padding (прозрачный/белый) до точного размера.
-    Результат: изображение РОВНО target_w x target_h с правильным AR.
+    Масштабирует изображение так, чтобы оно ЗАПОЛНИЛО весь кадр target_w x target_h,
+    обрезает излишки по центру. Результат: ТОЧНО target_w x target_h БЕЗ пустот.
     
     Args:
         img: Source PIL Image
@@ -38,43 +37,32 @@ def prepare_for_smart_object(img: Image.Image, target_w: int, target_h: int) -> 
         target_h: Target height in pixels
     
     Returns:
-        Image with exact dimensions and correct aspect ratio (with padding if needed)
+        Image with EXACT dimensions, covering entire frame (cropped if needed)
     """
     orig_w, orig_h = img.size
     target_ratio = target_w / target_h
     orig_ratio = orig_w / orig_h
     
-    # Вписываем изображение (fit mode)
-    if orig_ratio > target_ratio:
-        # Шире → подгоняем по ширине
-        new_w = target_w
-        new_h = int(target_w / orig_ratio)
-    else:
-        # Выше → подгоняем по высоте
-        new_h = target_h
-        new_w = int(target_h * orig_ratio)
+    # COVER mode: масштабируем так, чтобы заполнить весь кадр
+    # Выбираем бОльший коэффициент масштабирования
+    scale = max(target_w / orig_w, target_h / orig_h)
     
-    # Resize с качественным ресемплингом
+    new_w = int(orig_w * scale)
+    new_h = int(orig_h * scale)
+    
+    # Resize с высоким качеством
     resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
     
-    # Создаём canvas нужного размера
-    if img.mode == 'RGBA':
-        canvas = Image.new('RGBA', (target_w, target_h), (255, 255, 255, 0))
-    else:
-        canvas = Image.new('RGB', (target_w, target_h), (255, 255, 255))
+    # Обрезаем до точного размера (центрирование)
+    left = (new_w - target_w) // 2
+    top = (new_h - target_h) // 2
     
-    # Центрируем изображение
-    paste_x = (target_w - new_w) // 2
-    paste_y = (target_h - new_h) // 2
+    # Crop гарантирует ТОЧНЫЕ размеры
+    final = resized.crop((left, top, left + target_w, top + target_h))
     
-    if img.mode == 'RGBA':
-        canvas.paste(resized, (paste_x, paste_y), resized)
-    else:
-        canvas.paste(resized, (paste_x, paste_y))
+    logger.info(f"✅ Smart Object COVER: {orig_w}x{orig_h} → scale x{scale:.2f} → crop to {target_w}x{target_h}")
     
-    logger.info(f"✅ Smart Object padding: {orig_w}x{orig_h} → {new_w}x{new_h} on {target_w}x{target_h} canvas")
-    
-    return canvas
+    return final
 
 
 def resize_with_mode(
@@ -167,7 +155,7 @@ def prepare_image_for_psd(
     """
     # FIX БАГ 1: force_fill для Smart Objects
     if force_fill:
-        effective_mode = "fill"
+        effective_mode = "cover"
         effective_no_upscale = False
         logger.info("🔧 force_fill=True: игнорируем UI настройки, используем fill+upscale")
     else:

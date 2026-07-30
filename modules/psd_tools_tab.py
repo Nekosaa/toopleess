@@ -1,3 +1,5 @@
+"""PSD Tools Tab - профессиональный CustomTkinter UI с Photoshop COM."""
+
 from __future__ import annotations
 
 import csv
@@ -14,11 +16,13 @@ from core.i18n import i18n
 # ===== Импорт модуля умной подмены =====
 from modules.image_replace import resize_with_mode, prepare_for_smart_object
 from modules.so_picker import SOPickerWindow
+
 try:
     from PIL import Image, ImageFilter
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
+
 # ========================================
 
 LogFn = Callable[[str, str], None]
@@ -31,6 +35,7 @@ def _is_windows() -> bool:
 # ---------------------------------------------------------------------------
 # Layer-type helpers
 # ---------------------------------------------------------------------------
+
 def _is_group(layer) -> bool:
     for attr in ("LayerSets", "ArtLayers", "Layers"):
         try:
@@ -72,9 +77,11 @@ class PhotoshopBridge:
         self.app = None
         self.available = False
         self._init_error: Optional[str] = None
+
         if not _is_windows():
             self._init_error = "Photoshop COM is Windows-only."
             return
+
         try:
             try:
                 from win32com.client import gencache  # type: ignore
@@ -82,6 +89,7 @@ class PhotoshopBridge:
             except Exception:
                 import win32com.client as com  # type: ignore
                 self.app = com.Dispatch("Photoshop.Application")
+
             self.app.Visible = True
             try:
                 self.app.DisplayDialogs = 3
@@ -138,509 +146,229 @@ class PsdToolsFrame(ttk.Frame):
         "снимок", "picture", "pic", "user photo", "your photo",
     )
 
-    # Имена смарт-объектов, куда подставляется ОДНО и то же фото.
-    # В шаблоне фото дублируется в нескольких независимых SO:
-    #   Photo Dark frame → Photo Edit
-    #   Photo light frame → Photo Edit
-    #   Small Photo → Наложение
-    #   (+ Edit Small Photo, если это тоже SO)
+    # Имена смарт-объектов, куда подставляется ОДНО и то же фото
     _PHOTO_SO_NAMES = ("photo edit", "наложение", "edit small photo")
 
     # Порог: если min(sw, sh) < этого значения — спросить у юзера подтверждение
     _MIN_SOURCE_SIDE = 400
 
-    def __init__(self, master: tk.Misc, log: LogFn) -> None:
-        super().__init__(master, padding=(12, 8))
+    def __init__(self, master, log: LogFn) -> None:
+        super().__init__(master)
         self._log = log
-        self._ps: Optional[PhotoshopBridge] = None
+
+        self._ps = PhotoshopBridge()
         self._doc = None
         self._psd_path: Optional[Path] = None
-        self._layers_index: list[tuple[str, list]] = []
-        self._so_frames: dict[str, tuple] = {}
 
-        self._mode_var = tk.StringVar(value=config.get("psd_mode", "fill"))
-        self._no_upscale_var = tk.BooleanVar(value=bool(config.get("psd_no_upscale", False)))
-        self._clip_bounds_var = tk.BooleanVar(value=bool(config.get("psd_clip_to_bounds", True)))
-        self._inherit_meta_var = tk.BooleanVar(value=bool(config.get("psd_inherit_metadata", True)))
+        self._layers: list[tuple[str, list]] = []
+        self._so_frames: dict[str, tuple[float, float, float, float]] = {}
 
-        # Флаг «пользователь уже подтвердил мелкий исходник в этой сессии» —
-        # чтобы не спрашивать 20 раз при batch.
         self._small_source_ack = False
-
-        self._in_var = tk.StringVar(value=config.get("psd_in_dir"))
-        self._out_var = tk.StringVar(value=config.get("psd_out_dir"))
-
-        self._mode_var.trace_add("write",
-                                 lambda *_: config.set("psd_mode", self._mode_var.get()))
-        self._no_upscale_var.trace_add("write",
-                                       lambda *_: config.set("psd_no_upscale", bool(self._no_upscale_var.get())))
-        self._clip_bounds_var.trace_add("write",
-                                        lambda *_: config.set("psd_clip_to_bounds", bool(self._clip_bounds_var.get())))
-        self._inherit_meta_var.trace_add("write",
-                                         lambda *_: config.set("psd_inherit_metadata", bool(self._inherit_meta_var.get())))
-        self._in_var.trace_add("write",
-                               lambda *_: config.set("psd_in_dir", self._in_var.get()))
-        self._out_var.trace_add("write",
-                                lambda *_: config.set("psd_out_dir", self._out_var.get()))
 
         self._build()
         i18n.subscribe(self._retranslate)
 
+        if not self._ps.available:
+            self._log(f"Photoshop COM unavailable: {self._ps.error()}", "error")
+
     def _build(self) -> None:
-        self.columnconfigure(1, weight=1)
-        self.rowconfigure(1, weight=1)
+        main = ttk.Frame(self, padding=10)
+        main.pack(fill="both", expand=True)
 
-        toolbar = ttk.Frame(self)
-        toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        if self._ps and not self._ps.available:
+            self._warn = ttk.Label(main, text=f"{i18n.t('psd.no.photoshop')}", foreground="red")
+            self._warn.pack(pady=10)
+        else:
+            self._warn = None
 
-        self._btn_open = ttk.Button(toolbar, text=i18n.t("psd.open"), command=self.open_psd)
-        self._btn_scan = ttk.Button(toolbar, text=i18n.t("psd.scan"), command=self.scan_layers)
-        self._btn_unlck = ttk.Button(toolbar, text=i18n.t("psd.unlock"), command=self.unlock_all)
-        self._btn_repl = ttk.Button(toolbar, text=i18n.t("psd.replace"), command=self.replace_in_selected)
-        self._btn_auto = ttk.Button(toolbar, text="Авто фото", command=self.auto_replace_photo)
-        self._btn_picker = ttk.Button(toolbar, text="Выбор SO", command=self.open_so_picker)
-        self._btn_all_so = ttk.Button(toolbar, text="Во все SO", command=self.replace_all_so_dialog)
-        self._btn_csv = ttk.Button(toolbar, text="Batch CSV", command=self.batch_csv_replace)
-        for i, b in enumerate((self._btn_open, self._btn_scan, self._btn_unlck,
-                               self._btn_repl, self._btn_auto, self._btn_picker,
-                               self._btn_all_so, self._btn_csv)):
-            b.grid(row=0, column=i, padx=(0, 6))
+        # Open/Scan/Unlock
+        row0 = ttk.Frame(main)
+        row0.pack(fill="x", pady=5)
+        self._btn_open = ttk.Button(row0, text=i18n.t("psd.open"), command=self.open_psd)
+        self._btn_open.pack(side="left", padx=5)
+        self._btn_scan = ttk.Button(row0, text=i18n.t("psd.scan"), command=self.scan_layers)
+        self._btn_scan.pack(side="left", padx=5)
+        self._btn_unlck = ttk.Button(row0, text=i18n.t("psd.unlock"), command=self.unlock_layers)
+        self._btn_unlck.pack(side="left", padx=5)
 
-        left = ttk.Frame(self)
-        left.grid(row=1, column=0, sticky="ns", padx=(0, 12))
+        # Layers list
+        ttk.Label(main, text=i18n.t("psd.section.layers")).pack(anchor="w", pady=(10, 2))
+        frame_list = ttk.Frame(main)
+        frame_list.pack(fill="both", expand=True)
+        sb = ttk.Scrollbar(frame_list, orient="vertical")
+        sb.pack(side="right", fill="y")
+        self._tree = ttk.Treeview(frame_list, columns=("type",), show="tree headings", yscrollcommand=sb.set)
+        self._tree.heading("#0", text="Layer")
+        self._tree.heading("type", text="Type")
+        self._tree.column("type", width=80)
+        self._tree.pack(side="left", fill="both", expand=True)
+        sb.config(command=self._tree.yview)
 
-        self._lbl_layers = ttk.Label(left, text=i18n.t("psd.section.layers"),
-                                     font=("Segoe UI", 10, "bold"))
-        self._lbl_layers.pack(anchor="w", pady=(0, 6))
+        # Actions
+        ttk.Label(main, text=i18n.t("psd.section.actions")).pack(anchor="w", pady=(10, 2))
+        row_act = ttk.Frame(main)
+        row_act.pack(fill="x", pady=5)
 
-        self._listbox = tk.Listbox(left, width=42, height=22, activestyle="dotbox")
-        self._listbox.pack(fill="y", expand=False)
+        self._btn_repl = ttk.Button(row_act, text=i18n.t("psd.replace"), command=self.replace_selected)
+        self._btn_repl.pack(side="left", padx=5)
 
-        sb = ttk.Scrollbar(left, orient="vertical", command=self._listbox.yview)
-        self._listbox.configure(yscrollcommand=sb.set)
+        self._btn_auto = ttk.Button(row_act, text="Авто фото", command=self.auto_replace_photo)
+        self._btn_auto.pack(side="left", padx=5)
 
-        right = ttk.Frame(self)
-        right.grid(row=1, column=1, sticky="nsew")
-        right.columnconfigure(1, weight=1)
+        self._btn_picker = ttk.Button(row_act, text="Выбор SO", command=self.pick_so_and_replace)
+        self._btn_picker.pack(side="left", padx=5)
 
-        self._lbl_actions = ttk.Label(right, text=i18n.t("psd.section.actions"),
-                                      font=("Segoe UI", 10, "bold"))
-        self._lbl_actions.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        self._btn_all_so = ttk.Button(row_act, text="Во все SO", command=self.replace_all_photo_so)
+        self._btn_all_so.pack(side="left", padx=5)
 
-        self._lbl_mode = ttk.Label(right, text=i18n.t("psd.mode"))
-        self._lbl_mode.grid(row=1, column=0, sticky="w", pady=4)
-        self._rb_fit = ttk.Radiobutton(right, text=i18n.t("psd.mode.fit"),
-                                       variable=self._mode_var, value="fit")
-        self._rb_fill = ttk.Radiobutton(right, text=i18n.t("psd.mode.fill"),
-                                        variable=self._mode_var, value="fill")
-        self._rb_orig = ttk.Radiobutton(right, text=i18n.t("psd.mode.original"),
-                                        variable=self._mode_var, value="original")
-        self._rb_fit.grid(row=1, column=1, sticky="w")
-        self._rb_fill.grid(row=1, column=2, sticky="w")
-        self._rb_orig.grid(row=1, column=3, sticky="w")
+        # Mode
+        ttk.Label(main, text=i18n.t("psd.mode")).pack(anchor="w", pady=(10, 2))
+        self._mode_var = tk.StringVar(value=config.get("psd_mode", "fill"))
+        row_mode = ttk.Frame(main)
+        row_mode.pack(fill="x")
+        self._rb_fit = ttk.Radiobutton(row_mode, text=i18n.t("psd.mode.fit"), variable=self._mode_var, value="fit")
+        self._rb_fit.pack(side="left", padx=5)
+        self._rb_fill = ttk.Radiobutton(row_mode, text=i18n.t("psd.mode.fill"), variable=self._mode_var, value="fill")
+        self._rb_fill.pack(side="left", padx=5)
+        self._rb_orig = ttk.Radiobutton(row_mode, text=i18n.t("psd.mode.original"), variable=self._mode_var, value="original")
+        self._rb_orig.pack(side="left", padx=5)
 
-        self._lbl_mode_hint = ttk.Label(right, text=i18n.t("psd.mode.hint"),
-                                        foreground="#888", wraplength=520, justify="left")
-        self._lbl_mode_hint.grid(row=2, column=0, columnspan=4, sticky="w", pady=(2, 0))
+        ttk.Label(main, text=i18n.t("psd.mode.hint"), foreground="gray").pack(anchor="w", pady=2)
 
-        self._cb_no_upscale = ttk.Checkbutton(
-            right, text=i18n.t("psd.no.upscale"),
-            variable=self._no_upscale_var,
-        )
-        self._cb_no_upscale.grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        self._no_upscale_var = tk.BooleanVar(value=config.get("psd_no_upscale", False))
+        self._cb_no_upscale = ttk.Checkbutton(main, text=i18n.t("psd.no.upscale"), variable=self._no_upscale_var)
+        self._cb_no_upscale.pack(anchor="w", pady=2)
 
-        self._cb_clip_bounds = ttk.Checkbutton(
-            right, text=i18n.t("psd.clip.bounds"),
-            variable=self._clip_bounds_var,
-        )
-        self._cb_clip_bounds.grid(row=4, column=0, columnspan=4, sticky="w", pady=(2, 0))
+        self._clip_bounds_var = tk.BooleanVar(value=config.get("psd_clip_bounds", True))
+        self._cb_clip_bounds = ttk.Checkbutton(main, text=i18n.t("psd.clip.bounds"), variable=self._clip_bounds_var)
+        self._cb_clip_bounds.pack(anchor="w", pady=2)
 
-        self._cb_inherit_meta = ttk.Checkbutton(
-            right, text=i18n.t("psd.inherit.metadata"),
-            variable=self._inherit_meta_var,
-        )
-        self._cb_inherit_meta.grid(row=5, column=0, columnspan=4, sticky="w", pady=(2, 0))
+        self._inherit_meta_var = tk.BooleanVar(value=config.get("psd_inherit_metadata", True))
+        self._cb_inherit_meta = ttk.Checkbutton(main, text=i18n.t("psd.inherit.metadata"), variable=self._inherit_meta_var)
+        self._cb_inherit_meta.pack(anchor="w", pady=2)
 
-        ttk.Separator(right, orient="horizontal").grid(
-            row=6, column=0, columnspan=4, sticky="ew", pady=12,
-        )
+        # Batch
+        ttk.Label(main, text=i18n.t("psd.section.batch")).pack(anchor="w", pady=(10, 2))
 
-        self._lbl_batch = ttk.Label(right, text=i18n.t("psd.section.batch"),
-                                    font=("Segoe UI", 10, "bold"))
-        self._lbl_batch.grid(row=7, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        row_in = ttk.Frame(main)
+        row_in.pack(fill="x", pady=2)
+        self._lbl_in = ttk.Label(row_in, text=i18n.t("psd.in.folder"))
+        self._lbl_in.pack(side="left")
+        self._in_var = tk.StringVar(value=config.get("psd_in_folder", ""))
+        ttk.Entry(row_in, textvariable=self._in_var, width=30).pack(side="left", padx=5, fill="x", expand=True)
+        self._btn_in = ttk.Button(row_in, text=i18n.t("common.browse"), command=self._browse_in)
+        self._btn_in.pack(side="left")
 
-        self._lbl_in = ttk.Label(right, text=i18n.t("psd.in.folder"))
-        self._lbl_in.grid(row=8, column=0, sticky="w")
-        ttk.Entry(right, textvariable=self._in_var).grid(row=8, column=1, columnspan=2, sticky="ew", padx=6)
-        self._btn_in = ttk.Button(right, text=i18n.t("common.browse"),
-                                  command=lambda: self._pick(self._in_var, "psd_in_dir"))
-        self._btn_in.grid(row=8, column=3, sticky="w")
+        row_out = ttk.Frame(main)
+        row_out.pack(fill="x", pady=2)
+        self._lbl_out = ttk.Label(row_out, text=i18n.t("psd.out.folder"))
+        self._lbl_out.pack(side="left")
+        self._out_var = tk.StringVar(value=config.get("psd_out_folder", ""))
+        ttk.Entry(row_out, textvariable=self._out_var, width=30).pack(side="left", padx=5, fill="x", expand=True)
+        self._btn_out = ttk.Button(row_out, text=i18n.t("common.browse"), command=self._browse_out)
+        self._btn_out.pack(side="left")
 
-        self._lbl_out = ttk.Label(right, text=i18n.t("psd.out.folder"))
-        self._lbl_out.grid(row=9, column=0, sticky="w", pady=4)
-        ttk.Entry(right, textvariable=self._out_var).grid(row=9, column=1, columnspan=2, sticky="ew", padx=6, pady=4)
-        self._btn_out = ttk.Button(right, text=i18n.t("common.browse"),
-                                   command=lambda: self._pick(self._out_var, "psd_out_dir"))
-        self._btn_out.grid(row=9, column=3, sticky="w", pady=4)
+        row_batch = ttk.Frame(main)
+        row_batch.pack(fill="x", pady=5)
+        self._btn_batch = ttk.Button(row_batch, text=i18n.t("psd.batch"), command=self.batch_replace)
+        self._btn_batch.pack(side="left", padx=5)
 
-        self._btn_batch = ttk.Button(right, text=i18n.t("psd.batch"),
-                                     command=self.batch_replace)
-        self._btn_batch.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        self._btn_csv = ttk.Button(row_batch, text="Batch CSV", command=self.batch_csv_replace)
+        self._btn_csv.pack(side="left", padx=5)
 
-        self._warn = ttk.Label(self, text="", foreground="#c05555")
-        self._warn.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+    def _browse_in(self):
+        d = filedialog.askdirectory(title=i18n.t("psd.in.folder"))
+        if d:
+            self._in_var.set(d)
+            config.set("psd_in_folder", d)
 
-    def _pick(self, var: tk.StringVar, cfg_key: str) -> None:
-        chosen = filedialog.askdirectory(initialdir=var.get() or str(Path.home()))
-        if chosen:
-            var.set(chosen)
-            config.set(cfg_key, chosen)
+    def _browse_out(self):
+        d = filedialog.askdirectory(title=i18n.t("psd.out.folder"))
+        if d:
+            self._out_var.set(d)
+            config.set("psd_out_folder", d)
 
-    def _ensure_ps(self) -> bool:
-        if self._ps is None or not self._ps.is_alive():
-            if self._ps is not None and not self._ps.is_alive():
-                self._log("Photoshop connection lost – reconnecting…", "warn")
-                try:
-                    self._ps.reset()
-                except Exception:
-                    pass
-                self._doc = None
-                self._psd_path = None
-            try:
-                self._ps = PhotoshopBridge()
-            except Exception as exc:
-                self._log(f"Photoshop bridge init failed: {exc}", "error")
-                self._ps = None
-
-        if self._ps is None or not self._ps.available:
-            err = self._ps.error() if self._ps is not None else "no bridge"
-            self._warn.configure(text=f"{i18n.t('psd.no.photoshop')} ({err})")
-            self._log(i18n.t("psd.no.photoshop"), "error")
-            return False
-
-        self._warn.configure(text="")
-        try:
-            self._ps.app.BringToFront()
-        except Exception:
-            pass
-        return True
-
-    def open_psd(self) -> None:
-        import time
-
-        if not self._ensure_ps():
-            return
-        path = filedialog.askopenfilename(
-            title=i18n.t("psd.open"),
-            initialdir=config.get("psd_in_dir"),
-            filetypes=[("Photoshop", "*.psd *.psb"), ("All files", "*.*")],
-        )
+    def open_psd(self):
+        path = filedialog.askopenfilename(title=i18n.t("psd.open"), filetypes=[("PSD", "*.psd"), ("All", "*.*")])
         if not path:
             return
+        try:
+            self._doc = self._ps.open(path)
+            self._psd_path = Path(path)
+            self._log(f"Opened: {self._psd_path.name}", "ok")
+            self.scan_layers()
+        except Exception as e:
+            messagebox.showerror(i18n.t("error.title"), str(e))
+            self._log(f"Open failed: {e}", "error")
 
-        # Каждый новый PSD — сбрасываем ACK на мелкий исходник
-        self._small_source_ack = False
+    def scan_layers(self):
+        if not self._doc:
+            messagebox.showwarning(i18n.t("warning.title"), i18n.t("psd.no.doc"))
+            return
+        self._tree.delete(*self._tree.get_children())
+        self._layers.clear()
+        self._so_frames.clear()
 
-        last_exc: Optional[BaseException] = None
-        for attempt in range(3):
+        def walk(container, parent_id="", path=None):
+            if path is None:
+                path = []
             try:
-                self._doc = self._ps.open(path)
-                self._psd_path = Path(path)
-                config.set("psd_in_dir", str(self._psd_path.parent))
-                self._log(f"Opened: {self._psd_path.name}", "ok")
-                self.scan_layers()
+                count = container.Layers.Count
+            except Exception:
                 return
-            except Exception as exc:
-                last_exc = exc
-                msg = (str(exc) or exc.__class__.__name__)
-                low = msg.lower()
-                is_rpc = (
-                    "-2147023174" in msg
-                    or "rpc" in low
-                    or "недоступен" in low
-                    or "server unavailable" in low
-                )
-                if is_rpc and attempt < 2:
-                    self._log(f"RPC error on attempt {attempt + 1}/3 – reconnecting…", "warn")
+            for i in range(1, count + 1):
+                try:
+                    layer = container.Layers.Item(i)
+                    name = str(layer.Name)
+                except Exception:
+                    continue
+
+                new_path = path + [i]
+                is_grp = _is_group(layer)
+                is_so = _is_smart_object(layer) if not is_grp else False
+                typ = "Group" if is_grp else ("SmartObject" if is_so else "Raster")
+
+                node_id = self._tree.insert(parent_id, "end", text=name, values=(typ,))
+                self._layers.append((name, new_path))
+
+                if is_so:
                     try:
-                        if self._ps is not None:
-                            self._ps.reset()
+                        b = layer.Bounds
+                        l, t, r, bot = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+                        key = json.dumps(new_path)
+                        self._so_frames[key] = (l, t, r, bot)
                     except Exception:
                         pass
-                    self._doc = None
-                    self._psd_path = None
-                    time.sleep(1.0)
-                    if not self._ensure_ps():
-                        break
-                    continue
-                break
 
-        msg = (str(last_exc) or last_exc.__class__.__name__) if last_exc else "unknown"
-        hint = (
-            "\n\nВозможные причины:\n"
-            " • Photoshop закрыт или ещё не готов\n"
-            " • Открыт модальный диалог (Missing Fonts, Camera Raw)\n"
-            " • Файл заблокирован (OneDrive/Dropbox sync)\n"
-            " • Путь с не-ASCII символами"
-        )
-        messagebox.showerror(i18n.t("error.title"), f"{msg}{hint}")
-        self._log(msg, "error")
+                if is_grp:
+                    walk(layer, node_id, new_path)
 
-    def scan_layers(self) -> None:
-        if not self._ensure_ps() or self._doc is None:
-            self._log(i18n.t("psd.no.file"), "warn")
-            return
-        self._layers_index.clear()
-        self._listbox.delete(0, "end")
-        self._so_frames.clear()
-        max_depth = int(config.get("smart_object_depth", 3))
-        self._walk(self._doc, path=[], depth=0, max_depth=max_depth)
-        self._log(f"Layers scanned: {len(self._layers_index)}", "info")
+        walk(self._doc)
+        self._log(f"Scanned: {len(self._layers)} layers, {len(self._so_frames)} SO frames", "info")
 
-    def _enumerate_children(self, container) -> list:
-        out: list = []
-        try:
-            n = int(container.Layers.Count)
-        except Exception:
-            n = 0
-        if n > 0:
-            for i in range(1, n + 1):
-                try:
-                    out.append((container.Layers.Item(i), ("L", i)))
-                except Exception:
-                    continue
-            return out
-        try:
-            for i in range(1, int(container.ArtLayers.Count) + 1):
-                try:
-                    out.append((container.ArtLayers.Item(i), ("A", i)))
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        try:
-            for i in range(1, int(container.LayerSets.Count) + 1):
-                try:
-                    out.append((container.LayerSets.Item(i), ("S", i)))
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        return out
-
-    def _walk(self, container, path: list, depth: int, max_depth: int) -> None:
-        for layer, key in self._enumerate_children(container):
-            name = getattr(layer, "Name", f"Layer {key[1]}")
-            indent = "  " * depth
-
-            is_group = _is_group(layer)
-            is_so = (not is_group) and _is_smart_object(layer)
-
-            marker = ""
-            if is_group:
-                marker = " [G]"
-            elif is_so:
-                marker = " [SO]"
-            else:
-                try:
-                    b = layer.Bounds
-                    w = float(b[2]) - float(b[0])
-                    h = float(b[3]) - float(b[1])
-                    if w <= 0 or h <= 0:
-                        marker = " [empty]"
-                except Exception:
-                    pass
-
-            self._listbox.insert("end", f"{indent}{name}{marker}")
-            self._layers_index.append((name, path + [key]))
-
-            if is_group and depth < max_depth:
-                self._walk(layer, path + [key], depth + 1, max_depth)
-
-    def unlock_all(self) -> None:
-        if not self._ensure_ps() or self._doc is None:
-            self._log(i18n.t("psd.no.file"), "warn")
-            return
-        count = self._unlock_recursive(self._doc)
-        self._log(f"Unlocked {count} layers", "ok")
-
-    def _unlock_recursive(self, container) -> int:
-        unlocked = 0
-        try:
-            layer_count = container.Layers.Count
-        except Exception:
-            return 0
-        for i in range(1, layer_count + 1):
-            try:
-                layer = container.Layers.Item(i)
-            except Exception:
-                continue
-            for prop in ("AllLocked", "PixelsLocked", "PositionLocked", "TransparentPixelsLocked"):
-                try:
-                    setattr(layer, prop, False)
-                except Exception:
-                    pass
-            unlocked += 1
-            if _is_group(layer):
-                unlocked += self._unlock_recursive(layer)
-        return unlocked
-
-    def replace_in_selected(self) -> None:
-        if not self._ensure_ps() or self._doc is None:
-            self._log(i18n.t("psd.no.file"), "warn")
-            return
-        sel = self._listbox.curselection()
-        if not sel:
-            messagebox.showinfo(i18n.t("info.title"), i18n.t("psd.select.layer"))
-            return
-        name, path = self._layers_index[sel[0]]
-        image_path = filedialog.askopenfilename(
-            title=i18n.t("psd.replace"),
-            filetypes=[("Images", "*.jpg *.jpeg *.png *.tif *.tiff *.bmp"), ("All", "*.*")],
-        )
-        if not image_path:
+    def unlock_all(self):
+        if not self._doc:
             return
         try:
-            layer = self._resolve_layer(path)
-            self._replace_layer_content(layer, image_path, self._mode_var.get(),
-                                        frame_key=json.dumps(path))
-            self._log(f"Replaced photo in '{name}'", "ok")
-        except Exception as exc:
-            messagebox.showerror(i18n.t("error.title"), str(exc))
-            self._log(str(exc), "error")
-
-    def _resolve_layer(self, path: list):
-        node = self._doc
-        for step in path:
-            if isinstance(step, tuple):
-                kind, idx = step
-                if kind == "A":
-                    node = node.ArtLayers.Item(idx)
-                elif kind == "S":
-                    node = node.LayerSets.Item(idx)
-                else:
-                    node = node.Layers.Item(idx)
-            else:
-                node = node.Layers.Item(step)
-        return node
-
-    # ============================================================
-    # УМНАЯ ПОДГОТОВКА ИЗОБРАЖЕНИЯ
-    # ============================================================
-
-    def _prepare_image_for_psd(
-        self,
-        new_image_path: str,
-        target_width: int,
-        target_height: int,
-        mode: str = "fill",
-        force_mode: Optional[str] = None,
-        use_padding: bool = False,
-    ) -> str:
-        """
-        Готовит картинку под слот.
-        force_mode: если задан ("fill"/"fit"/...), игнорирует режим из UI.
-        use_padding: если True, использует prepare_for_smart_object.
-        """
-        if not PIL_AVAILABLE:
-            self._log("Pillow недоступен, пропускаем подготовку", "warn")
-            return new_image_path
-        if target_width <= 0 or target_height <= 0:
-            self._log(f"Target bounds invalid ({target_width}x{target_height})", "warn")
-            return new_image_path
-
-        try:
-            no_upscale = bool(self._no_upscale_var.get())
-        except Exception:
-            no_upscale = False
-
-        if force_mode:
-            effective_mode = force_mode
-        else:
-            try:
-                ui_mode = self._mode_var.get() or mode
-            except Exception:
-                ui_mode = mode
-            effective_mode = ui_mode or "fill"
-
-        # ФИКС: при принудительном fill (Smart Object / raster-fill) нельзя
-        # уважать no_upscale — иначе мелкий исходник (напр. 200×200) не
-        # растянется на весь фрейм SO (1208×1480) и получим крошечное фото
-        # по центру на чёрном фоне.
-        if effective_mode == "fill":
-            no_upscale = False
-
-        try:
-            with Image.open(new_image_path) as new_img:
-                new_img.load()
-                sw, sh = new_img.size
-                scale = max(target_width / max(sw, 1), target_height / max(sh, 1))
-
-                # Проверка на мелкий исходник
-                if (min(sw, sh) < self._MIN_SOURCE_SIDE
-                        and not no_upscale
-                        and not self._small_source_ack):
-                    proceed = messagebox.askyesno(
-                        "Мелкое фото",
-                        f"Исходник {sw}×{sh}, слот {target_width}×{target_height}"
-                        f" (upscale x{scale:.1f}).\n\n"
-                        f"Результат будет мыльный.\n\n"
-                        f"Продолжить?",
-                    )
-                    if not proceed:
-                        self._log("Замена отменена пользователем (мелкий исходник)", "warn")
-                        return new_image_path
-                    self._small_source_ack = True
-
-                if scale > 2.0 and not no_upscale:
-                    self._log(
-                        f"⚠ Upscale x{scale:.1f}: применяю LANCZOS.",
-                        "warn",
-                    )
-
-                # для SO с паддингом используем prepare_for_smart_object
-                if use_padding:
-                    result_img = prepare_for_smart_object(new_img, target_width, target_height)
-                else:
-                    result_img = resize_with_mode(
-                        new_img,
-                        target_width,
-                        target_height,
-                        mode=effective_mode,
-                        no_upscale=no_upscale,
-                    )
-
-                # НЕ применяем sharpen — это меняет пиксели и делает
-                # результат "хрустящим", отличным от оригинала.
-
-                if result_img.mode not in ("RGB", "RGBA"):
-                    result_img = result_img.convert("RGB")
-
-                self._log(
-                    f"Prepare: {sw}×{sh} → {result_img.size[0]}×{result_img.size[1]} "
-                    f"({effective_mode}, "
-                    f"{'padding' if use_padding else ('no-upscale' if no_upscale else f'upscale x{scale:.1f}')})",
-                    "info",
-                )
-                return self._save_temp(result_img, new_image_path)
+            jsx = """
+(function() {
+    function unlock(container) {
+        for (var i = 0; i < container.layers.length; i++) {
+            var L = container.layers[i];
+            if (L.typename === "LayerSet") {
+                unlock(L);
+            }
+            try { L.allLocked = false; } catch(_) {}
+        }
+    }
+    unlock(app.activeDocument);
+    return "OK";
+})();
+"""
+            self._ps.app.DoJavaScript(jsx)
+            self._log("All layers unlocked", "ok")
         except Exception as e:
-            self._log(f"Prepare failed: {e}, using original", "warn")
-            return new_image_path
-
-    def _save_temp(self, img, original_path: str) -> str:
-        try:
-            temp_dir = Path(original_path).parent / ".prizma_temp"
-            temp_dir.mkdir(parents=True, exist_ok=True)
-            temp_file = temp_dir / f"prepared_{Path(original_path).stem}.png"
-            img.save(temp_file, format="PNG", optimize=False)
-            return str(temp_file)
-        except Exception as e:
-            self._log(f"Temp save failed: {e}, using original", "warn")
-            return original_path
-
-    # ============================================================
-    # SMART OBJECT REPLACE
-    # ============================================================
+            self._log(f"Unlock failed: {e}", "error")
 
     def _read_so_true_size(self, so_layer=None) -> Optional[tuple[float, float]]:
         """
@@ -718,8 +446,9 @@ class PsdToolsFrame(ttk.Frame):
         try:
             result = self._ps.app.DoJavaScript(jsx)
             raw = str(result).strip() if result is not None else ""
+            self._log(f"[DEBUG] JS true_size raw result: '{raw}'", "info")
             if not raw or raw.startswith("ERR"):
-                self._log(f"SO true-size: {raw or 'no result'}, trying editContents fallback", "warn")
+                self._log(f"⚠ SO true-size JS failed: {raw or 'empty'}, trying editContents", "warn")
                 return self._read_so_size_via_edit_contents(so_layer)
             parts = raw.split("|")
             if len(parts) < 2:
@@ -727,7 +456,7 @@ class PsdToolsFrame(ttk.Frame):
             w = float(parts[0]); h = float(parts[1])
             src = parts[2] if len(parts) > 2 else "?"
             if w > 0 and h > 0:
-                self._log(f"SO content size source: {src} ({w:.0f}x{h:.0f}px)", "info")
+                self._log(f"✅ SO content size source: {src} ({w:.0f}x{h:.0f}px)", "info")
                 return (w, h)
         except Exception as e:
             self._log(f"SO true-size read failed: {e}", "warn")
@@ -756,19 +485,42 @@ class PsdToolsFrame(ttk.Frame):
             if so_layer:
                 self._doc.ActiveLayer = so_layer
             result = self._ps.app.DoJavaScript(jsx)
-            if not result.startswith("ERR"):
-                parts = result.split("|")
-                w = float(parts[0])
-                h = float(parts[1])
-                self._log(f"SO size via editContents: {w:.0f}x{h:.0f}px", "info")
-                return (w, h)
+            
+            raw_result = str(result).strip()
+            self._log(f"[DEBUG] editContents raw result: '{raw_result}'", "info")
+            
+            if not raw_result.startswith("ERR"):
+                parts = raw_result.split("|")
+                if len(parts) >= 2:
+                    try:
+                        w = float(parts[0])
+                        h = float(parts[1])
+                        if w > 0 and h > 0:
+                            self._log(f"✅ SO size via editContents: {w:.0f}x{h:.0f}px", "ok")
+                            return (w, h)
+                        else:
+                            self._log(f"⚠ editContents returned invalid dimensions: {w}x{h}", "warn")
+                    except (ValueError, IndexError) as e:
+                        self._log(f"⚠ editContents parse error: {e}", "warn")
+                else:
+                    self._log(f"⚠ editContents returned invalid format: '{raw_result}'", "warn")
+            else:
+                self._log(f"⚠ editContents returned error: {raw_result}", "warn")
+                
         except Exception as e:
-            self._log(f"Edit contents fallback failed: {e}", "error")
+            self._log(f"❌ Edit contents exception: {type(e).__name__}: {e}", "error")
+            try:
+                import traceback
+                self._log(f"Traceback: {traceback.format_exc()}", "error")
+            except:
+                pass
+                
         return None
 
     def _replace_smart_object(self, so_layer, image_path: str, mode: str,
                               frame_key: Optional[str] = None,
                               isolate: bool = False) -> None:
+        """Заменить содержимое Smart Object с сохранением трансформаций"""
         self._doc.ActiveLayer = so_layer
 
         fw = fh = 0
@@ -776,25 +528,47 @@ class PsdToolsFrame(ttk.Frame):
         if true_size:
             fw = int(round(true_size[0]))
             fh = int(round(true_size[1]))
-            self._log(f"SO content frame: {fw}x{fh}px", "info")
+            self._log(f"✅ SO content frame: {fw}x{fh}px", "info")
         else:
-            try:
-                stored_frame = self._so_frames.get(frame_key) if frame_key else None
-                if stored_frame:
-                    fl, ft, fr, fb = stored_frame
-                else:
-                    b = so_layer.Bounds
-                    fl = float(b[0]); ft = float(b[1])
-                    fr = float(b[2]); fb = float(b[3])
-                fw = int(round(fr - fl))
-                fh = int(round(fb - ft))
-                self._log(f"SO AABB fallback: {fw}x{fh}px", "warn")
-            except Exception as e:
-                self._log(f"SO bounds read failed: {e}", "warn")
-                fw = fh = 0
+            # Пробуем editContents как более точный fallback
+            self._log(f"⚠ JS true_size failed, trying editContents fallback", "warn")
+            edit_size = self._read_so_size_via_edit_contents(so_layer)
+            
+            if edit_size and edit_size[0] > 0 and edit_size[1] > 0:
+                fw = int(round(edit_size[0]))
+                fh = int(round(edit_size[1]))
+                self._log(f"✅ SO embedded size: {fw}x{fh}px (via editContents)", "ok")
+            else:
+                # Последний fallback - bounds (НЕ РЕКОМЕНДУЕТСЯ для замены!)
+                self._log(f"⚠⚠ All SO size detection failed, using canvas bounds", "error")
+                try:
+                    stored_frame = self._so_frames.get(frame_key) if frame_key else None
+                    if stored_frame:
+                        fl, ft, fr, fb = stored_frame
+                    else:
+                        b = so_layer.Bounds
+                        fl = float(b[0]); ft = float(b[1])
+                        fr = float(b[2]); fb = float(b[3])
+                    fw = int(round(fr - fl))
+                    fh = int(round(fb - ft))
+                    self._log(f"⚠⚠⚠ Using canvas bounds: {fw}x{fh}px - РЕЗУЛЬТАТ МОЖЕТ БЫТЬ НЕТОЧНЫМ!", "error")
+                    
+                    # Показываем предупреждение пользователю
+                    try:
+                        messagebox.showwarning(
+                            "Внимание",
+                            f"Не удалось определить точный размер Smart Object.\n\n"
+                            f"Используется размер на канвасе: {fw}x{fh}px\n"
+                            f"Результат может быть искажён.\n\n"
+                            f"Рекомендация: пересохраните PSD."
+                        )
+                    except:
+                        pass
+                except Exception as e:
+                    self._log(f"❌ SO bounds read failed: {e}", "error")
+                    fw = fh = 1000  # Default fallback
 
-        # Заменяем фото ИДЕНТИЧНО оригиналу: режим FILL БЕЗ padding —
-        # иначе появляются белые полосы по краям.
+        # Заменяем фото ИДЕНТИЧНО оригиналу: режим FILL БЕЗ padding
         prepared_path = image_path
         if PIL_AVAILABLE and fw > 0 and fh > 0:
             prepared_path = self._prepare_image_for_psd(
@@ -810,741 +584,476 @@ class PsdToolsFrame(ttk.Frame):
         if frame_key and returned:
             self._so_frames[frame_key] = returned
 
-    def _run_so_replace_contents_jsx(self, image_path: str, mode: str,
-                                     frame_literal: str, isolate: bool = False):
+    def _run_so_replace_contents_jsx(
+        self, image_path: str, fill_mode: str, frame: str, isolate: bool = False
+    ):
         """
-        Замена контента Smart Object.
-        Photoshop САМ сохраняет трансформацию контейнера (перспектива/наклон/
-        поворот), маску слоя и стили (fx).
+        Замена контента SO через placedLayerReplaceContents.
+        isolate=True: не затрагивает связанные копии (использует unique ID).
         """
-        path_literal = json.dumps(str(Path(image_path)))
-        isolate_literal = "true" if isolate else "false"
+        norm = str(Path(image_path).resolve()).replace("\\", "/")
 
-        jsx = r"""
-(function () {
-    var NEW_PATH = __PATH__;
-    var ISOLATE = __ISOLATE__;
-
-    var doc = app.activeDocument;
-
-    var savedRulerUnits = app.preferences.rulerUnits;
-    var savedTypeUnits = app.preferences.typeUnits;
-    app.preferences.rulerUnits = Units.PIXELS;
-    app.preferences.typeUnits = TypeUnits.PIXELS;
-
-    function dist(x1,y1,x2,y2){var dx=x2-x1,dy=y2-y1;return Math.sqrt(dx*dx+dy*dy);}
-
-    function readSOQuad() {
-        var o = { ok:false, angle:0, flipped:false, hasSkew:false,
-                 tl_x:0, tl_y:0, tr_x:0, tr_y:0, br_x:0, br_y:0, bl_x:0, bl_y:0,
-                 w:0, h:0 };
-        try {
-            var ref = new ActionReference();
-            ref.putEnumerated(charIDToTypeID("Lyr "),
-                            charIDToTypeID("Ordn"),
-                            charIDToTypeID("Trgt"));
-            var lyrDesc = executeActionGet(ref);
-            var soDesc = lyrDesc.getObjectValue(stringIDToTypeID("smartObject"));
-            var t = soDesc.getList(stringIDToTypeID("transform"));
-            o.tl_x=t.getDouble(0); o.tl_y=t.getDouble(1);
-            o.tr_x=t.getDouble(2); o.tr_y=t.getDouble(3);
-            o.br_x=t.getDouble(4); o.br_y=t.getDouble(5);
-            o.bl_x=t.getDouble(6); o.bl_y=t.getDouble(7);
-            var dxTop=o.tr_x-o.tl_x, dyTop=o.tr_y-o.tl_y;
-            var dxLeft=o.bl_x-o.tl_x, dyLeft=o.bl_y-o.tl_y;
-            o.angle=Math.atan2(dyTop,dxTop)*180/Math.PI;
-            o.flipped=((dxTop*dyLeft - dyTop*dxLeft) < 0);
-            o.w=dist(o.tl_x,o.tl_y,o.tr_x,o.tr_y);
-            o.h=dist(o.tl_x,o.tl_y,o.bl_x,o.bl_y);
-            var wBottom=dist(o.bl_x,o.bl_y,o.br_x,o.br_y);
-            var hRight =dist(o.tr_x,o.tr_y,o.br_x,o.br_y);
-            var wDiff=Math.abs(o.w-wBottom)/Math.max(o.w,0.001);
-            var hDiff=Math.abs(o.h-hRight )/Math.max(o.h,0.001);
-            var dotTL=dxTop*dxLeft+dyTop*dyLeft;
-            var cosA =Math.abs(dotTL/((o.w*o.h)+0.001));
-            o.hasSkew=(wDiff>0.005 || hDiff>0.005 || cosA>0.01);
-            o.ok=true;
-        } catch(e) {}
-        return o;
-    }
-
-    var before = readSOQuad();
-
-    var isolateStatus = "skip";
-    if (ISOLATE) {
-        try { doc.selection.deselect(); } catch(_) {}
-        try {
-            executeAction(stringIDToTypeID("placedLayerNewViaCopy"),
-                         undefined, DialogModes.NO);
-            isolateStatus = "ok";
-        } catch(e) {
-            isolateStatus = "FAILED:" + ((e && e.message) ? e.message : String(e));
-        }
-    }
-
-    // ЕДИНСТВЕННОЕ действие: заменить контент
-    var d0 = new ActionDescriptor();
-    d0.putPath(charIDToTypeID('null'), new File(NEW_PATH));
-    try { d0.putInteger(charIDToTypeID('PgNm'), 1); } catch(e) {}
-    executeAction(stringIDToTypeID('placedLayerReplaceContents'), d0, DialogModes.NO);
-
-    // проверка correspondence после замены
-    var after = readSOQuad();
-    var finalW = 0, finalH = 0;
-    try {
-        var refAfter = new ActionReference();
-        refAfter.putEnumerated(charIDToTypeID("Lyr "),
-                              charIDToTypeID("Ordn"),
-                              charIDToTypeID("Trgt"));
-        var lyrDescAfter = executeActionGet(refAfter);
-        var soDescAfter = lyrDescAfter.getObjectValue(stringIDToTypeID("smartObject"));
-        if (soDescAfter.hasKey(stringIDToTypeID("size"))) {
-            var fs = soDescAfter.getObjectValue(stringIDToTypeID("size"));
-            finalW = fs.getUnitDoubleValue(stringIDToTypeID("width"));
-            finalH = fs.getUnitDoubleValue(stringIDToTypeID("height"));
-        }
-    } catch(e) {}
-
-    app.preferences.rulerUnits = savedRulerUnits;
-    app.preferences.typeUnits = savedTypeUnits;
-
-    var transformed = before.ok && (before.hasSkew
-                                   || Math.abs(before.angle) > 1.0
-                                   || before.flipped);
-    return before.tl_x + "|" + before.tl_y + "|" + before.tr_x + "|" + before.tr_y
-         + "|" + before.br_x + "|" + before.br_y + "|" + before.bl_x + "|" + before.bl_y
-         + "|" + before.angle.toFixed(2)
-         + "|" + (before.flipped ? "1" : "0")
-         + "|" + (before.hasSkew ? "1" : "0")
-         + "|" + (transformed ? "1" : "0")
-         + "|" + before.w.toFixed(1) + "|" + before.h.toFixed(1)
-         + "|pure-replace"
-         + "|" + isolateStatus
-         + "|finalSize:" + finalW.toFixed(0) + "x" + finalH.toFixed(0);
-})();
+        jsx_template = r"""
+(function() {{
+    try {{
+        var idplacedLayerReplaceContents = stringIDToTypeID("placedLayerReplaceContents");
+        var desc = new ActionDescriptor();
+        desc.putPath(charIDToTypeID("null"), new File("{image_path}"));
+        desc.putEnumerated(charIDToTypeID("FTcs"), charIDToTypeID("QCSt"),
+                          stringIDToTypeID("{fill_mode}"));
+        executeAction(idplacedLayerReplaceContents, desc, DialogModes.NO);
+        return "OK";
+    }} catch(e) {{
+        return "ERR:"+e.message;
+    }}
+}})();
 """
-        jsx = (jsx
-               .replace("__PATH__", path_literal)
-               .replace("__ISOLATE__", isolate_literal))
-        result = self._ps.app.DoJavaScript(jsx)
-        raw = str(result).strip() if result is not None else ""
-        parts = raw.split("|")
+        jsx = jsx_template.format(image_path=norm, fill_mode=fill_mode)
 
-        if len(parts) >= 8:
-            try:
-                corners = tuple(float(p) for p in parts[:8])
-                transformed = parts[11] == "1" if len(parts) > 11 else False
-                method = parts[14] if len(parts) > 14 else "?"
-                iso_status = parts[15] if len(parts) > 15 else "skip"
+        try:
+            result = str(self._ps.app.DoJavaScript(jsx))
+            if result.startswith("ERR"):
+                raise RuntimeError(result)
+            self._log(f"SO content replaced: {Path(image_path).name}", "ok")
+            return None
+        except Exception as e:
+            self._log(f"SO replace failed: {e}", "error")
+            raise
 
-                final_size_str = "unknown"
-                if len(parts) > 16 and "finalSize:" in parts[16]:
-                    final_size_str = parts[16].replace("finalSize:", "")
+    def _replace_raster_merge_down(self, layer, image_path: str, mode: str):
+        """Замена для растровых слоев: Place → Merge Down"""
+        try:
+            b = layer.Bounds
+            l, t, r, bot = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+            width = int(round(r - l))
+            height = int(round(bot - t))
+        except Exception as e:
+            self._log(f"Raster bounds read failed: {e}", "warn")
+            width = height = 500
 
-                xs = [corners[0], corners[2], corners[4], corners[6]]
-                ys = [corners[1], corners[3], corners[5], corners[7]]
-                frame = (min(xs), min(ys), max(xs), max(ys))
+        prepared_path = image_path
+        if PIL_AVAILABLE and width > 0 and height > 0:
+            prepared_path = self._prepare_image_for_psd(
+                image_path, width, height, mode=mode, force_mode="fill", use_padding=False
+            )
 
-                if iso_status.startswith("FAILED"):
-                    self._log(f"SO isolate FAILED: {iso_status[7:]}", "warn")
+        self._doc.ActiveLayer = layer
+        name = str(layer.Name)
+        self._run_merge_down_jsx(prepared_path, l, t)
+        self._log(f"Raster replaced (merge): {name}", "ok")
 
-                self._log(
-                    f"SO replace: {method}, "
-                    f"frame {frame[2]-frame[0]:.0f}x{frame[3]-frame[1]:.0f}px, "
-                    f"{'transformed' if transformed else 'flat'}, "
-                    f"content: {final_size_str}",
-                    "info",
-                )
-                return frame
-            except ValueError:
-                pass
-        return None
+    def _run_merge_down_jsx(self, image_path: str, left: float, top: float):
+        """Place image → Merge Down"""
+        norm = str(Path(image_path).resolve()).replace("\\", "/")
+        jsx = r"""
+(function() {{
+    try {{
+        var f = new File("{image_path}");
+        var desc1 = new ActionDescriptor();
+        desc1.putPath(charIDToTypeID("null"), f);
+        desc1.putEnumerated(charIDToTypeID("FTcs"), charIDToTypeID("QCSt"),
+                           charIDToTypeID("Qcsa"));
+        var desc2 = new ActionDescriptor();
+        desc2.putUnitDouble(charIDToTypeID("Hrzn"), charIDToTypeID("#Pxl"), {left});
+        desc2.putUnitDouble(charIDToTypeID("Vrtc"), charIDToTypeID("#Pxl"), {top});
+        desc1.putObject(charIDToTypeID("Ofst"), charIDToTypeID("Ofst"), desc2);
+        executeAction(charIDToTypeID("Plc "), desc1, DialogModes.NO);
 
-    # ============================================================
-    # RASTER REPLACE
-    # ============================================================
+        executeAction(charIDToTypeID("Mrg2"), undefined, DialogModes.NO);
+        return "OK";
+    }} catch(e) {{
+        return "ERR:"+e.message;
+    }}
+}})();
+""".format(image_path=norm, left=left, top=top)
 
-    def _replace_layer_content(self, layer, image_path: str, mode: str,
-                               frame_key: Optional[str] = None) -> None:
-        if _is_group(layer):
-            raise RuntimeError("Selected item is a group (LayerSet), not a photo layer.")
+        result = str(self._ps.app.DoJavaScript(jsx))
+        if result.startswith("ERR"):
+            raise RuntimeError(result)
 
+    def _replace_layer_content(self, layer, image_path: str, mode: str, frame_key: Optional[str] = None):
+        """Dispatcher: SO или raster"""
         if _is_smart_object(layer):
-            self._replace_smart_object(layer, image_path, mode, frame_key)
+            self._replace_smart_object(layer, image_path, mode, frame_key=frame_key)
         else:
             self._replace_raster_merge_down(layer, image_path, mode)
 
-    def _replace_raster_merge_down(self, layer, image_path: str, mode: str) -> None:
-        prepared_path = image_path
-        try:
-            bounds = layer.Bounds
-            target_width = int(float(bounds[2]) - float(bounds[0]))
-            target_height = int(float(bounds[3]) - float(bounds[1]))
+    def _prepare_image_for_psd(
+        self,
+        image_path: str,
+        target_width: int,
+        target_height: int,
+        mode: str = "fill",
+        force_mode: Optional[str] = None,
+        use_padding: bool = False,
+    ) -> str:
+        """Подготовка изображения: resize, padding, save"""
+        from modules.image_replace import prepare_image_for_psd
 
-            if target_width > 0 and target_height > 0:
-                # принудительно FILL — новое фото должно ЗАПОЛНИТЬ границы
-                # оригинального слоя ровно как оригинал (без искажений и полей).
-                prepared_path = self._prepare_image_for_psd(
-                    image_path, target_width, target_height,
-                    force_mode="fill", use_padding=False,
+        out_dir = Path(self._psd_path).parent / "temp_prepared"
+        out_dir.mkdir(exist_ok=True)
+
+        stem = Path(image_path).stem
+        out_path = out_dir / f"{stem}_prepared.png"
+
+        effective_mode = force_mode if force_mode else mode
+        no_upscale = self._no_upscale_var.get()
+
+        # Для SO с force_fill игнорируем no_upscale
+        if force_mode == "fill":
+            no_upscale = False
+
+        try:
+            from PIL import Image
+            img = Image.open(image_path)
+            
+            # Проверка размера исходника
+            sw, sh = img.size
+            if min(sw, sh) < self._MIN_SOURCE_SIDE and not self._small_source_ack:
+                ans = messagebox.askyesno(
+                    "Маленький исходник",
+                    f"Исходник {sw}x{sh}px слишком мал (рекомендуется >{self._MIN_SOURCE_SIDE}px).\n"
+                    f"При масштабировании до {target_width}x{target_height}px качество снизится.\n\n"
+                    f"Продолжить?",
                 )
+                if not ans:
+                    raise RuntimeError("User cancelled due to small source")
+                self._small_source_ack = True
+
+            # Resize
+            if use_padding:
+                result_img = prepare_for_smart_object(img, target_width, target_height)
+            else:
+                result_img = resize_with_mode(
+                    img, target_width, target_height, mode=effective_mode, no_upscale=no_upscale
+                )
+
+            # Save
+            result_img.save(str(out_path))
+            self._log(f"✅ Saved prepared: {out_path.name} ({result_img.size[0]}x{result_img.size[1]}px)", "ok")
+            return str(out_path)
+
         except Exception as e:
-            self._log(f"Prep raster failed: {e}", "warn")
+            self._log(f"Image prepare failed: {e}", "error")
+            return image_path
 
-        self._doc.ActiveLayer = layer
-        self._run_merge_down_jsx(prepared_path, "exact")
-
-    def _run_merge_down_jsx(self, image_path: str, mode: str) -> None:
-        path_literal = json.dumps(str(Path(image_path)))
-        clip_literal = "true" if bool(config.get("psd_clip_to_bounds", True)) else "false"
-
-        jsx = r"""
-(function () {
-    var NEW_PATH = __PATH__;
-    var CLIP = __CLIP__;
-
-    var doc = app.activeDocument;
-    var target = doc.activeLayer;
-    var targetName = target.name;
-
-    var savedRulerUnits = app.preferences.rulerUnits;
-    var savedTypeUnits = app.preferences.typeUnits;
-    app.preferences.rulerUnits = Units.PIXELS;
-    app.preferences.typeUnits = TypeUnits.PIXELS;
-
-    function asPx(v){ try { return v.as('px'); } catch(e){ return Number(v); } }
-
-    var b = target.bounds;
-    var L = asPx(b[0]), T = asPx(b[1]), R = asPx(b[2]), Bt = asPx(b[3]);
-    var W = R - L, H = Bt - T;
-    var usedCanvas = false;
-    var diagW = W, diagH = H;
-
-    if (W <= 0 || H <= 0) {
-        L = 0; T = 0;
-        R = asPx(doc.width); Bt = asPx(doc.height);
-        W = R - L; H = Bt - T;
-        usedCanvas = true;
-    }
-    if (W <= 0 || H <= 0) {
-        app.preferences.rulerUnits = savedRulerUnits;
-        app.preferences.typeUnits = savedTypeUnits;
-        throw new Error("Empty bounds and canvas.");
-    }
-
-    try { target.allLocked = false; } catch(e) {}
-    try { target.pixelsLocked = false; } catch(e) {}
-    try { target.positionLocked = false; } catch(e) {}
-    try { target.transparentPixelsLocked = false; } catch(e) {}
-
-    doc.activeLayer = target;
-    doc.selection.select([[L,T],[R,T],[R,Bt],[L,Bt]], SelectionType.REPLACE);
-    try { doc.selection.clear(); } catch(e) {}
-    try { doc.selection.deselect(); } catch(e) {}
-
-    var f = new File(NEW_PATH);
-    var d = new ActionDescriptor();
-    d.putPath(charIDToTypeID('null'), f);
-    d.putEnumerated(charIDToTypeID('FTcs'), charIDToTypeID('QCSt'), charIDToTypeID('Qcsa'));
-    executeAction(charIDToTypeID('Plc '), d, DialogModes.NO);
-    var placed = doc.activeLayer;
-
-    var pb = placed.bounds;
-    var pw = asPx(pb[2]) - asPx(pb[0]);
-    var ph = asPx(pb[3]) - asPx(pb[1]);
-    if (pw > 0 && ph > 0) {
-        var sx = W / pw;
-        var sy = H / ph;
-        placed.resize(sx * 100.0, sy * 100.0, AnchorPosition.MIDDLECENTER);
-    }
-
-    pb = placed.bounds;
-    var cx = (asPx(pb[0]) + asPx(pb[2])) / 2;
-    var cy = (asPx(pb[1]) + asPx(pb[3])) / 2;
-    placed.translate((L + R) / 2 - cx, (T + Bt) / 2 - cy);
-
-    try { placed.rasterize(RasterizeType.ENTIRELAYER); } catch(e) {}
-
-    if (CLIP) {
-        try {
-            doc.selection.select([[L,T],[R,T],[R,Bt],[L,Bt]], SelectionType.REPLACE);
-            doc.selection.invert();
-            doc.activeLayer = placed;
-            try { doc.selection.clear(); } catch(e) {}
-            try { doc.selection.deselect(); } catch(e) {}
-        } catch(e) {}
-    }
-
-    var mergeStatus = "MERGED";
-    try {
-        placed.merge();
-    } catch (mergeErr) {
-        mergeStatus = "FALLBACK";
-        try {
-            doc.activeLayer = target;
-            try { target.isBackgroundLayer = false; } catch(e) {}
-            try { target.allLocked = false; } catch(e) {}
-            target.remove();
-        } catch (rmErr) {}
-        try { doc.activeLayer = placed; } catch(e) {}
-    }
-
-    try { doc.activeLayer.name = targetName; } catch(e) {}
-
-    app.preferences.rulerUnits = savedRulerUnits;
-    app.preferences.typeUnits = savedTypeUnits;
-
-    return mergeStatus + "|" + diagW + "|" + diagH + "|" + (usedCanvas ? "1" : "0");
-})();
-"""
-        jsx = jsx.replace("__PATH__", path_literal).replace("__CLIP__", clip_literal)
-        result = self._ps.app.DoJavaScript(jsx)
-        status_raw = str(result).strip() if result is not None else ""
-        parts = status_raw.split("|")
-        status = parts[0] if parts else ""
-        diag_w = parts[1] if len(parts) > 1 else "?"
-        diag_h = parts[2] if len(parts) > 2 else "?"
-        used_canvas = parts[3] == "1" if len(parts) > 3 else False
-        self._log(
-            f"Raster bounds: {diag_w}x{diag_h}px"
-            + (" (fallback → canvas)" if used_canvas else ""),
-            "info",
-        )
-        if status == "FALLBACK":
-            self._log("merge_down недоступен: placed оставлен вместо target", "warn")
-
-    # ============================================================
-    # SO PICKER
-    # ============================================================
-
-    def open_so_picker(self) -> None:
-        if not self._ensure_ps() or self._doc is None:
-            self._log(i18n.t("psd.no.file"), "warn")
+    def replace_selected(self):
+        if not self._doc:
+            messagebox.showwarning(i18n.t("warning.title"), i18n.t("psd.no.doc"))
             return
 
-        if not self._layers_index:
-            self.scan_layers()
-
-        so_layers: list[tuple[str, list, tuple]] = []
-        for (name, path) in self._layers_index:
-            try:
-                layer = self._resolve_layer(path)
-            except Exception:
-                continue
-            if _is_group(layer):
-                continue
-            if not _is_smart_object(layer):
-                continue
-            try:
-                b = layer.Bounds
-                bounds = (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
-            except Exception:
-                bounds = (0.0, 0.0, 0.0, 0.0)
-            so_layers.append((name, path, bounds))
-
-        if not so_layers:
-            messagebox.showinfo(
-                i18n.t("info.title"),
-                "В PSD не найдено ни одного Smart Object.",
-            )
-            return
-
-        self._log(f"SO picker: найдено {len(so_layers)} SO-слоёв", "info")
-
-        SOPickerWindow(
-            master=self,
-            so_layers=so_layers,
-            psd_path=self._psd_path,
-            on_replace=self._on_so_picked,
-        )
-
-    def _on_so_picked(self, name: str, path: list, image_path: str) -> None:
-        try:
-            layer = self._resolve_layer(path)
-            if not _is_smart_object(layer):
-                raise RuntimeError(f"Слой '{name}' не является Smart Object")
-
-            self._replace_smart_object(
-                layer, image_path,
-                mode="fill",
-                frame_key=json.dumps(path),
-                isolate=False,
-            )
-            self._log(
-                f"SO picker: заменено только в '{name}' (связанные копии не тронуты)",
-                "ok",
-            )
-        except Exception as exc:
-            messagebox.showerror(i18n.t("error.title"), str(exc))
-            self._log(str(exc), "error")
-
-    # ============================================================
-    # ЗАМЕНА ВО ВСЕХ ФОТО-SO РАЗОМ
-    # ============================================================
-
-    def replace_photo_in_all_so(self, image_path: str) -> int:
-        """
-        Подставляет ОДНО фото во ВСЕ фото-смартобъекты шаблона
-        (Photo Edit в обоих фреймах + Наложение + Edit Small Photo).
-        В шаблоне фото продублировано в нескольких независимых SO,
-        поэтому замена только одного оставляет остальные со старым фото.
-        Возвращает количество успешно заменённых SO.
-        """
-        targets: list[tuple[str, list]] = []
-        for (name, path) in self._layers_index:
-            try:
-                layer = self._resolve_layer(path)
-            except Exception:
-                continue
-            if _is_group(layer) or not _is_smart_object(layer):
-                continue
-            if name.strip().lower() in self._PHOTO_SO_NAMES:
-                targets.append((name, path))
-
-        if not targets:
-            self._log("Не найдено фото-SO по именам из _PHOTO_SO_NAMES", "warn")
-            return 0
-
-        replaced = 0
-        for name, path in targets:
-            try:
-                layer = self._resolve_layer(path)
-                self._replace_smart_object(
-                    layer, image_path, mode="fill",
-                    frame_key=json.dumps(path), isolate=False,
-                )
-                self._log(f"Заменено в SO '{name}'", "ok")
-                replaced += 1
-            except Exception as exc:
-                self._log(f"SO '{name}': {exc}", "error")
-
-        self._log(f"Замена во всех SO: {replaced}/{len(targets)}", "ok")
-        return replaced
-
-    def replace_all_so_dialog(self) -> None:
-        """Кнопка «Во все SO»: выбрать одно фото и подставить во все фото-SO."""
-        if not self._ensure_ps() or self._doc is None:
-            self._log(i18n.t("psd.no.file"), "warn")
-            return
-        if not self._layers_index:
-            self.scan_layers()
-
-        image_path = filedialog.askopenfilename(
-            title="Фото для всех SO",
-            filetypes=[("Images", "*.jpg *.jpeg *.png *.tif *.tiff *.bmp"), ("All", "*.*")],
-        )
-        if not image_path:
-            return
-
-        # не спрашивать про upscale на каждом SO
-        self._small_source_ack = True
-        try:
-            n = self.replace_photo_in_all_so(image_path)
-            if n == 0:
-                messagebox.showwarning(
-                    i18n.t("info.title"),
-                    "Не найдено ни одного фото-SO для замены.\n\n"
-                    "Проверь имена SO в шаблоне и список _PHOTO_SO_NAMES.",
-                )
-            else:
-                self._log(f"Готово: фото подставлено в {n} SO", "ok")
-                messagebox.showinfo(
-                    i18n.t("info.title"),
-                    f"Фото подставлено в {n} смарт-объект(ов).",
-                )
-        except Exception as exc:
-            messagebox.showerror(i18n.t("error.title"), str(exc))
-            self._log(str(exc), "error")
-
-    # ============================================================
-    # АВТОПОИСК СЛОЯ ДЛЯ ФОТО
-    # ============================================================
-
-    def _find_photo_layer(self) -> Optional[tuple[str, list]]:
-        if not self._layers_index:
-            return None
-
-        so_by_name: list = []
-        raster_by_name: list = []
-        all_so: list = []
-
-        for (name, path) in self._layers_index:
-            try:
-                layer = self._resolve_layer(path)
-            except Exception:
-                continue
-            if _is_group(layer):
-                continue
-
-            area = 0.0
-            try:
-                b = layer.Bounds
-                w = float(b[2]) - float(b[0])
-                h = float(b[3]) - float(b[1])
-                area = max(0.0, w * h)
-            except Exception:
-                pass
-
-            is_so = _is_smart_object(layer)
-            name_low = name.lower().strip()
-            keyword_hit = any(kw in name_low for kw in self._PHOTO_KEYWORDS)
-
-            if is_so:
-                all_so.append((area, name, path))
-                if keyword_hit:
-                    so_by_name.append((area, name, path))
-            else:
-                if keyword_hit and area > 0:
-                    raster_by_name.append((area, name, path))
-
-        if so_by_name:
-            so_by_name.sort(key=lambda t: -t[0])
-            _, name, path = so_by_name[0]
-            self._log(f"Auto: SO по имени → '{name}'", "info")
-            return (name, path)
-
-        if raster_by_name:
-            raster_by_name.sort(key=lambda t: -t[0])
-            _, name, path = raster_by_name[0]
-            self._log(f"Auto: растр по имени → '{name}'", "info")
-            return (name, path)
-
-        if all_so:
-            all_so.sort(key=lambda t: -t[0])
-            _, name, path = all_so[0]
-            self._log(f"Auto: самый большой SO → '{name}'", "info")
-            return (name, path)
-
-        return None
-
-    def auto_replace_photo(self) -> None:
-        if not self._ensure_ps() or self._doc is None:
-            self._log(i18n.t("psd.no.file"), "warn")
-            return
-
-        if not self._layers_index:
-            self.scan_layers()
-
-        found = self._find_photo_layer()
-        if not found:
-            messagebox.showwarning(
-                i18n.t("info.title"),
-                "Не удалось автоматически найти слой для фото.\n\n"
-                "Возможные причины:\n"
-                " • В PSD нет Smart Object слоёв\n"
-                " • Слои названы нестандартно\n\n"
-                "Выбери слой вручную из списка слева.",
-            )
-            return
-
-        name, path = found
-
-        try:
-            for idx, (nm, pt) in enumerate(self._layers_index):
-                if nm == name and pt == path:
-                    self._listbox.selection_clear(0, "end")
-                    self._listbox.selection_set(idx)
-                    self._listbox.activate(idx)
-                    self._listbox.see(idx)
-                    break
-        except Exception:
-            pass
-
-        image_path = filedialog.askopenfilename(
-            title=f"Фото для '{name}'",
-            filetypes=[("Images", "*.jpg *.jpeg *.png *.tif *.tiff *.bmp"), ("All", "*.*")],
-        )
-        if not image_path:
-            return
-
-        try:
-            layer = self._resolve_layer(path)
-            self._replace_layer_content(layer, image_path, self._mode_var.get(),
-                                        frame_key=json.dumps(path))
-            self._log(f"Auto: фото подставлено в '{name}'", "ok")
-        except Exception as exc:
-            messagebox.showerror(i18n.t("error.title"), str(exc))
-            self._log(str(exc), "error")
-
-    # ============================================================
-    # BATCH
-    # ============================================================
-
-    def batch_replace(self) -> None:
-        if not self._ensure_ps():
-            return
-        in_dir = Path(self._in_var.get() or "")
-        out_dir = Path(self._out_var.get() or "")
-        if not in_dir.is_dir():
-            messagebox.showerror(i18n.t("error.title"), f"Bad in-folder: {in_dir}")
-            return
-        out_dir.mkdir(parents=True, exist_ok=True)
-        images = [p for p in in_dir.iterdir()
-                  if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp")]
-        if not images:
-            messagebox.showinfo(i18n.t("info.title"), "No images found in in-folder")
-            return
-        sel = self._listbox.curselection()
+        sel = self._tree.selection()
         if not sel:
-            messagebox.showinfo(i18n.t("info.title"), i18n.t("psd.select.layer"))
-            return
-        name, path = self._layers_index[sel[0]]
-
-        if self._doc is None or self._psd_path is None:
-            self._log(i18n.t("psd.no.file"), "warn")
+            messagebox.showwarning(i18n.t("warning.title"), "No layer selected")
             return
 
-        self._small_source_ack = False
+        idx = self._tree.index(sel[0])
+        if idx >= len(self._layers):
+            return
 
-        self._log(f"Batch: {len(images)} image(s) → layer '{name}'", "info")
-        frame_key = json.dumps(path)
+        name, path = self._layers[idx]
+        layer = self._resolve_layer(path)
 
-        success_count = 0
-        for img in images:
-            try:
-                layer = self._resolve_layer(path)
-                self._replace_layer_content(layer, str(img), self._mode_var.get(),
-                                            frame_key=frame_key)
-                target = out_dir / f"{self._psd_path.stem}__{img.stem}.psd"
-                self._doc.SaveAs(str(target))
-                self._log(f"Saved: {target.name}", "ok")
-                success_count += 1
-            except Exception as exc:
-                self._log(f"{img.name}: {exc}", "error")
+        image_path = filedialog.askopenfilename(
+            title="Select image",
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.tif *.tiff *.bmp"), ("All", "*.*")],
+        )
+        if not image_path:
+            return
 
-        self._log(f"Batch complete: {success_count}/{len(images)} успешно", "ok")
+        try:
+            mode = self._mode_var.get()
+            config.set("psd_mode", mode)
+            config.set("psd_no_upscale", self._no_upscale_var.get())
 
-    # ============================================================
-    # BATCH CSV (мульти-слой мульти-вариант)
-    # ============================================================
+            frame_key = json.dumps(path)
+            self._replace_layer_content(layer, image_path, mode, frame_key=frame_key)
+            self._log(f"Replaced: {name}", "ok")
 
-    def _find_layer_by_name(self, layer_name: str) -> Optional[tuple[str, list]]:
-        """Ищет слой в _layers_index по точному имени (case-insensitive)."""
-        target = layer_name.strip().lower()
-        for (name, path) in self._layers_index:
-            if name.strip().lower() == target:
+        except Exception as e:
+            messagebox.showerror(i18n.t("error.title"), str(e))
+            self._log(f"Replace failed: {e}", "error")
+
+    def _resolve_layer(self, path: list):
+        """Resolve layer by path [1,2,3,...]"""
+        obj = self._doc
+        for idx in path:
+            obj = obj.Layers.Item(idx)
+        return obj
+
+    def _find_layer_by_name(self, target_name: str):
+        """Find first layer by name"""
+        target_lower = target_name.lower()
+        for name, path in self._layers:
+            if name.lower() == target_lower:
                 return (name, path)
         return None
 
-    def _parse_csv_mapping(self, csv_path: Path) -> tuple[list[str], list[dict]]:
-        """
-        Читает CSV. Возвращает (layer_columns, rows).
-        Первая колонка = output_name, остальные = имена слоёв.
-        Относительные пути резолвятся от папки CSV.
-        """
-        csv_dir = csv_path.parent
-        rows: list[dict] = []
-        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.reader(f)
-            header = next(reader, None)
-            if not header or len(header) < 2:
-                raise ValueError("CSV должен содержать минимум 2 колонки: output_name, LayerName")
-            layer_columns = [h.strip() for h in header[1:]]
+    def _find_photo_layer(self):
+        """Auto-detect photo layer"""
+        # Priority 1: SO by name
+        for name, path in self._layers:
+            if name.lower() in self._PHOTO_SO_NAMES:
+                layer = self._resolve_layer(path)
+                if _is_smart_object(layer):
+                    return (name, path)
 
-            for line_no, cols in enumerate(reader, start=2):
-                if not cols or all(not c.strip() for c in cols):
-                    continue
-                if len(cols) < 2:
-                    self._log(f"CSV строка {line_no}: пропуск (мало колонок)", "warn")
-                    continue
-                out_name = cols[0].strip()
-                if not out_name:
-                    self._log(f"CSV строка {line_no}: пустой output_name — пропуск", "warn")
-                    continue
+        # Priority 2: Raster by keywords
+        for name, path in self._layers:
+            nl = name.lower()
+            if any(kw in nl for kw in self._PHOTO_KEYWORDS):
+                layer = self._resolve_layer(path)
+                if not _is_smart_object(layer) and not _is_group(layer):
+                    return (name, path)
 
-                mapping: dict[str, Path] = {}
-                for i, layer_name in enumerate(layer_columns):
-                    if i + 1 >= len(cols):
-                        break
-                    raw = cols[i + 1].strip().strip('"')
-                    if not raw:
-                        continue
-                    p = Path(raw)
-                    if not p.is_absolute():
-                        p = (csv_dir / p).resolve()
-                    if not p.exists():
-                        self._log(
-                            f"CSV строка {line_no}: файл не найден '{p}' — пропуск слоя",
-                            "warn",
-                        )
-                        continue
-                    mapping[layer_name] = p
+        # Priority 3: Largest SO
+        largest = None
+        largest_area = 0
+        for name, path in self._layers:
+            key = json.dumps(path)
+            if key in self._so_frames:
+                l, t, r, b = self._so_frames[key]
+                area = (r - l) * (b - t)
+                if area > largest_area:
+                    largest_area = area
+                    largest = (name, path)
+        return largest
 
-                if mapping:
-                    rows.append({"output_name": out_name, "photos": mapping})
-        return layer_columns, rows
-
-    def batch_csv_replace(self) -> None:
-        """
-        Батч замены по CSV.
-        1) Открытый PSD = шаблон.
-        2) CSV: output_name, LayerName1, LayerName2, ...
-        3) Для каждой строки: заменить все указанные слои → SaveAs {output_name}.psd.
-        """
-        if not self._ensure_ps() or self._doc is None or self._psd_path is None:
-            self._log(i18n.t("psd.no.file"), "warn")
-            messagebox.showinfo(
-                i18n.t("info.title"),
-                "Сначала откройте PSD-шаблон.",
-            )
+    def auto_replace_photo(self):
+        """Auto replace photo layer"""
+        if not self._doc:
+            messagebox.showwarning(i18n.t("warning.title"), i18n.t("psd.no.doc"))
             return
 
-        if not self._layers_index:
-            self.scan_layers()
+        found = self._find_photo_layer()
+        if not found:
+            messagebox.showinfo(i18n.t("info.title"), "Photo layer not found")
+            return
 
-        csv_path_str = filedialog.askopenfilename(
-            title="CSV с маппингом слоёв",
-            filetypes=[("CSV", "*.csv"), ("All", "*.*")],
+        name, path = found
+        self._log(f"Auto-detected photo layer: {name}", "info")
+
+        image_path = filedialog.askopenfilename(
+            title="Select photo",
+            filetypes=[("Images", "*.jpg *.jpeg *.png"), ("All", "*.*")],
         )
-        if not csv_path_str:
+        if not image_path:
             return
-        csv_path = Path(csv_path_str)
-
-        out_dir_str = filedialog.askdirectory(
-            title="Папка для выходных PSD",
-            initialdir=self._out_var.get() or str(csv_path.parent),
-        )
-        if not out_dir_str:
-            return
-        out_dir = Path(out_dir_str)
-        out_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            layer_columns, rows = self._parse_csv_mapping(csv_path)
-        except Exception as exc:
-            messagebox.showerror(i18n.t("error.title"), f"Ошибка чтения CSV: {exc}")
-            self._log(f"CSV parse failed: {exc}", "error")
+            layer = self._resolve_layer(path)
+            mode = self._mode_var.get()
+            frame_key = json.dumps(path)
+            self._replace_layer_content(layer, image_path, mode, frame_key=frame_key)
+            self._log(f"Auto-replaced: {name}", "ok")
+        except Exception as e:
+            messagebox.showerror(i18n.t("error.title"), str(e))
+            self._log(f"Auto-replace failed: {e}", "error")
+
+    def pick_so_and_replace(self):
+        """Open SO picker dialog"""
+        if not self._doc or not self._psd_path:
+            messagebox.showwarning(i18n.t("warning.title"), i18n.t("psd.no.doc"))
             return
+
+        so_layers = []
+        for name, path in self._layers:
+            layer = self._resolve_layer(path)
+            if _is_smart_object(layer):
+                key = json.dumps(path)
+                bounds = self._so_frames.get(key, (0, 0, 100, 100))
+                so_layers.append((name, path, bounds))
+
+        if not so_layers:
+            messagebox.showinfo(i18n.t("info.title"), "No Smart Objects found")
+            return
+
+        def on_replace(name: str, path_key: list, img_path: str):
+            try:
+                layer = self._resolve_layer(path_key)
+                mode = self._mode_var.get()
+                frame_key = json.dumps(path_key)
+                self._replace_smart_object(layer, img_path, mode, frame_key=frame_key, isolate=True)
+                self._log(f"SO replaced: {name}", "ok")
+            except Exception as e:
+                messagebox.showerror(i18n.t("error.title"), str(e))
+                self._log(f"SO replace failed: {e}", "error")
+
+        SOPickerWindow(self.winfo_toplevel(), so_layers, self._psd_path, on_replace)
+
+    def replace_all_photo_so(self):
+        """Replace all photo SO layers with same image"""
+        if not self._doc:
+            messagebox.showwarning(i18n.t("warning.title"), i18n.t("psd.no.doc"))
+            return
+
+        image_path = filedialog.askopenfilename(
+            title="Select photo for all SO",
+            filetypes=[("Images", "*.jpg *.jpeg *.png"), ("All", "*.*")],
+        )
+        if not image_path:
+            return
+
+        matched = []
+        for name, path in self._layers:
+            if name.lower() in self._PHOTO_SO_NAMES:
+                layer = self._resolve_layer(path)
+                if _is_smart_object(layer):
+                    matched.append((name, path, layer))
+
+        if not matched:
+            messagebox.showinfo(i18n.t("info.title"), "No matching photo SO found")
+            return
+
+        try:
+            mode = self._mode_var.get()
+            for name, path, layer in matched:
+                frame_key = json.dumps(path)
+                self._replace_smart_object(layer, image_path, mode, frame_key=frame_key)
+                self._log(f"Replaced SO: {name}", "ok")
+
+            messagebox.showinfo(i18n.t("info.title"), f"Replaced {len(matched)} SO layers")
+        except Exception as e:
+            messagebox.showerror(i18n.t("error.title"), str(e))
+            self._log(f"Batch SO replace failed: {e}", "error")
+
+    def batch_replace(self):
+        """Simple batch: one image to one layer across multiple PSDs"""
+        in_folder = self._in_var.get()
+        out_folder = self._out_var.get()
+
+        if not in_folder or not out_folder:
+            messagebox.showwarning(i18n.t("warning.title"), "Set input/output folders")
+            return
+
+        in_dir = Path(in_folder)
+        out_dir = Path(out_folder)
+        if not in_dir.exists():
+            messagebox.showerror(i18n.t("error.title"), f"Input folder not found: {in_dir}")
+            return
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        images = list(in_dir.glob("*.jpg")) + list(in_dir.glob("*.png"))
+        if not images:
+            messagebox.showinfo(i18n.t("info.title"), "No images found in input folder")
+            return
+
+        if not self._psd_path:
+            messagebox.showwarning(i18n.t("warning.title"), "Open template PSD first")
+            return
+
+        template_path = str(self._psd_path)
+        found = self._find_photo_layer()
+        if not found:
+            messagebox.showinfo(i18n.t("info.title"), "Photo layer not found in template")
+            return
+
+        layer_name, layer_path = found
+        self._log(f"Batch target layer: {layer_name}", "info")
+
+        mode = self._mode_var.get()
+        success = 0
+
+        for img_path in images:
+            stem = img_path.stem
+            try:
+                # Reopen template
+                if success > 0:
+                    try:
+                        self._doc.Close(2)
+                    except:
+                        pass
+                    self._doc = self._ps.open(template_path)
+                    self.scan_layers()
+
+                layer = self._resolve_layer(layer_path)
+                frame_key = json.dumps(layer_path)
+                self._replace_layer_content(layer, str(img_path), mode, frame_key=frame_key)
+
+                out_path = out_dir / f"{stem}.psd"
+                self._doc.SaveAs(str(out_path))
+                self._log(f"Saved: {out_path.name}", "ok")
+                success += 1
+
+            except Exception as e:
+                self._log(f"Batch failed for {stem}: {e}", "error")
+
+        messagebox.showinfo(i18n.t("info.title"), f"Batch done: {success}/{len(images)} saved to {out_dir}")
+
+    def batch_csv_replace(self):
+        """Advanced batch: CSV mapping (output_name, layer1, layer2, ...)"""
+        csv_path = filedialog.askopenfilename(
+            title="Select CSV mapping",
+            filetypes=[("CSV", "*.csv"), ("All", "*.*")],
+        )
+        if not csv_path:
+            return
+
+        out_folder = self._out_var.get()
+        if not out_folder:
+            messagebox.showwarning(i18n.t("warning.title"), "Set output folder")
+            return
+
+        out_dir = Path(out_folder)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Parse CSV
+        try:
+            with open(csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                rows_raw = list(reader)
+        except Exception as e:
+            messagebox.showerror(i18n.t("error.title"), f"CSV read failed: {e}")
+            return
+
+        if not rows_raw:
+            messagebox.showinfo(i18n.t("info.title"), "CSV is empty")
+            return
+
+        # Expected format: output_name, <layer_columns>
+        # Each cell in layer column = path to image file
+        layer_columns = [c for c in rows_raw[0].keys() if c != "output_name"]
+        if not layer_columns:
+            messagebox.showerror(i18n.t("error.title"), "CSV must have layer columns")
+            return
+
+        rows = []
+        for r in rows_raw:
+            out_name = r.get("output_name", "").strip()
+            if not out_name:
+                continue
+            photos = {}
+            for col in layer_columns:
+                val = r.get(col, "").strip()
+                if val:
+                    photos[col] = Path(val)
+            if photos:
+                rows.append({"output_name": out_name, "photos": photos})
 
         if not rows:
-            messagebox.showinfo(i18n.t("info.title"), "В CSV нет валидных строк.")
+            messagebox.showinfo(i18n.t("info.title"), "No valid rows in CSV")
             return
 
-        # Проверка что все слои из header есть в PSD
-        missing = [ln for ln in layer_columns if not self._find_layer_by_name(ln)]
-        if missing:
-            proceed = messagebox.askyesno(
-                "Внимание",
-                "Не найдены слои в PSD:\n • " + "\n • ".join(missing)
-                + "\n\nПродолжить (пропущенные слои игнорируются)?",
-            )
-            if not proceed:
-                return
+        if not self._psd_path:
+            messagebox.showwarning(i18n.t("warning.title"), "Open template PSD first")
+            return
 
-        self._small_source_ack = True  # не спрашивать 20 раз про upscale
-        self._log(f"CSV batch: {len(rows)} вариант(ов), {len(layer_columns)} слой(ёв)", "info")
+        self._log(f"CSV batch: {len(rows)} variant(s), {len(layer_columns)} layer(s)", "info")
 
         template_path = str(self._psd_path)
         success = 0
+
         for idx, row in enumerate(rows, start=1):
             out_name = row["output_name"]
             photos: dict[str, Path] = row["photos"]
+
             try:
-                # Каждый раз открываем чистый шаблон, чтобы замены не накапливались
+                # Reopen template
                 if idx > 1:
                     try:
-                        self._doc.Close(2)  # 2 = DoNotSaveChanges
-                    except Exception:
+                        self._doc.Close(2)
+                    except:
                         pass
                     self._doc = self._ps.open(template_path)
                     self.scan_layers()
@@ -1552,10 +1061,12 @@ class PsdToolsFrame(ttk.Frame):
                 for layer_name, photo_path in photos.items():
                     found = self._find_layer_by_name(layer_name)
                     if not found:
-                        self._log(f"[{out_name}] слой '{layer_name}' не найден — skip", "warn")
+                        self._log(f"[{out_name}] layer '{layer_name}' not found - skip", "warn")
                         continue
+
                     _n, path = found
                     layer = self._resolve_layer(path)
+
                     self._replace_layer_content(
                         layer, str(photo_path), self._mode_var.get(),
                         frame_key=json.dumps(path),
@@ -1566,13 +1077,14 @@ class PsdToolsFrame(ttk.Frame):
                 self._doc.SaveAs(str(target))
                 self._log(f"Saved: {target.name}", "ok")
                 success += 1
+
             except Exception as exc:
                 self._log(f"[{out_name}] FAILED: {exc}", "error")
 
-        self._log(f"CSV batch complete: {success}/{len(rows)} PSD сохранено в {out_dir}", "ok")
+        self._log(f"CSV batch complete: {success}/{len(rows)} PSD saved to {out_dir}", "ok")
         messagebox.showinfo(
             i18n.t("info.title"),
-            f"Готово: {success}/{len(rows)} PSD сохранено в:\n{out_dir}",
+            f"Done: {success}/{len(rows)} PSD saved to:\n{out_dir}",
         )
 
     def _retranslate(self) -> None:
@@ -1593,16 +1105,18 @@ class PsdToolsFrame(ttk.Frame):
         ]
         for widget, key in pairs:
             widget.configure(text=i18n.t(key))
+
         self._btn_auto.configure(text="Авто фото")
         self._btn_picker.configure(text="Выбор SO")
         self._btn_all_so.configure(text="Во все SO")
         self._btn_csv.configure(text="Batch CSV")
-        self._lbl_layers.configure(text=i18n.t("psd.section.layers"))
-        self._lbl_actions.configure(text=i18n.t("psd.section.actions"))
-        self._lbl_batch.configure(text=i18n.t("psd.section.batch"))
-        self._lbl_mode.configure(text=i18n.t("psd.mode"))
-        self._lbl_mode_hint.configure(text=i18n.t("psd.mode.hint"))
+
         self._lbl_in.configure(text=i18n.t("psd.in.folder"))
         self._lbl_out.configure(text=i18n.t("psd.out.folder"))
+
         if self._ps and not self._ps.available:
             self._warn.configure(text=f"{i18n.t('psd.no.photoshop')} ({self._ps.error()})")
+
+
+# Alias для импорта
+PsdToolsFrameCTk = PsdToolsFrame

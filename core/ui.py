@@ -14,6 +14,10 @@ except ImportError:
     ImageDraw = None
 
 
+# ---------------------------------------------------------------------------
+# Вспомогательные функции
+# ---------------------------------------------------------------------------
+
 def _hex(c: str):
     c = c.lstrip("#")
     return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
@@ -28,7 +32,8 @@ def grad_ctkimage(w: int, h: int, c1: str, c2: str, c3: str | None = None,
     """Горизонтальный градиент c1 -> [c2 ->] c3 с опциональным скруглением."""
     if Image is None:
         return None
-    w = max(1, int(w)); h = max(1, int(h))
+    w = max(1, int(w))
+    h = max(1, int(h))
 
     if c3 is None:
         stops = [_hex(c1), _hex(c2)]
@@ -44,15 +49,18 @@ def grad_ctkimage(w: int, h: int, c1: str, c2: str, c3: str | None = None,
         local_t = t * n - seg
         (r1, g1, b1) = stops[seg]
         (r2, g2, b2) = stops[seg + 1]
-        px[x, 0] = (_lerp(r1, r2, local_t),
-                    _lerp(g1, g2, local_t),
-                    _lerp(b1, b2, local_t))
-    grad = row.resize((w, h)).convert("RGBA")
+        px[x, 0] = (
+            _lerp(r1, r2, local_t),
+            _lerp(g1, g2, local_t),
+            _lerp(b1, b2, local_t),
+        )
 
+    grad = row.resize((w, h)).convert("RGBA")
     if radius > 0 and ImageDraw is not None:
         mask = Image.new("L", (w, h), 0)
-        ImageDraw.Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1],
-                                               radius=radius, fill=255)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            [0, 0, w - 1, h - 1], radius=radius, fill=255
+        )
         grad.putalpha(mask)
 
     return ctk.CTkImage(light_image=grad, dark_image=grad, size=(w, h))
@@ -61,15 +69,21 @@ def grad_ctkimage(w: int, h: int, c1: str, c2: str, c3: str | None = None,
 def solid_ctkimage(w: int, h: int, color: str, radius: int = 0):
     if Image is None:
         return None
-    w = max(1, int(w)); h = max(1, int(h))
+    w = max(1, int(w))
+    h = max(1, int(h))
     img = Image.new("RGBA", (w, h), _hex(color) + (255,))
     if radius > 0 and ImageDraw is not None:
         mask = Image.new("L", (w, h), 0)
-        ImageDraw.Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1],
-                                               radius=radius, fill=255)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            [0, 0, w - 1, h - 1], radius=radius, fill=255
+        )
         img.putalpha(mask)
     return ctk.CTkImage(light_image=img, dark_image=img, size=(w, h))
 
+
+# ---------------------------------------------------------------------------
+# GradientDivider
+# ---------------------------------------------------------------------------
 
 class GradientDivider(ctk.CTkLabel):
     """Тонкая горизонтальная линия-градиент во всю ширину."""
@@ -90,14 +104,20 @@ class GradientDivider(ctk.CTkLabel):
         self._last_w = event.width
         if self._after:
             self.after_cancel(self._after)
+        # ВАЖНО: имя _render, а не _draw (последнее занято customtkinter)
         self._after = self.after(80, lambda w=event.width: self._render(w))
 
     def _render(self, w: int):
-        img = grad_ctkimage(w, self._height_px, self._c1, self._c2, self._c3, radius=0)
+        img = grad_ctkimage(w, self._height_px, self._c1, self._c2, self._c3,
+                            radius=0)
         if img:
             self._img = img
             self.configure(image=img)
 
+
+# ---------------------------------------------------------------------------
+# NavButton
+# ---------------------------------------------------------------------------
 
 class NavButton(ctk.CTkFrame):
     """Пункт бокового меню с профессиональным видом.
@@ -114,6 +134,11 @@ class NavButton(ctk.CTkFrame):
         "Segoe MDL2 Assets",
     )
 
+    # Отступы внутри кнопки
+    _ICON_X = 12          # x-координата иконки
+    _LABEL_X = 48         # x-координата текста
+    _RIGHT_PAD = 8        # правый паддинг
+
     def __init__(self, master, text: str, c1: str, c2: str,
                  c3: str | None = None,
                  icon: str = "",
@@ -122,9 +147,10 @@ class NavButton(ctk.CTkFrame):
                  active_bg: str = "#1A1F29",
                  hover_bg: str = "#161A22",
                  **kw):
-        super().__init__(master, width=width, height=height,
-                         fg_color="transparent", corner_radius=10,
-                         border_width=0)
+        super().__init__(
+            master, width=width, height=height,
+            fg_color="transparent", corner_radius=10, border_width=0,
+        )
         self.grid_propagate(False)
         self.pack_propagate(False)
 
@@ -149,16 +175,18 @@ class NavButton(ctk.CTkFrame):
             text_color=inactive_color,
             fg_color="transparent",
         )
-        self._icon.place(x=14, y=0)
+        self._icon.place(x=self._ICON_X, y=0)
 
-        # Текст
+        # Текст. ВАЖНО: width передаём в конструктор, а не в .place()
+        label_width = max(1, width - self._LABEL_X - self._RIGHT_PAD)
         self._label = ctk.CTkLabel(
-            self, text=text, height=height,
+            self, text=text, width=label_width, height=height,
             font=("Segoe UI Semibold", 13),
             text_color=inactive_color,
-            anchor="w", fg_color="transparent",
+            fg_color="transparent",
+            anchor="w",
         )
-        self._label.place(x=48, y=0, relwidth=1, width=-56)
+        self._label.place(x=self._LABEL_X, y=0)
 
         # Клики / hover
         for w in (self, self._icon, self._label):
@@ -170,7 +198,18 @@ class NavButton(ctk.CTkFrame):
             except Exception:
                 pass
 
+        # Адаптивная ширина текста при изменении размера кнопки
+        self.bind("<Configure>", self._on_configure)
+
     # ------------------------------------------------------------------
+    def _on_configure(self, event):
+        # Пересчитываем ширину лейбла под текущую ширину кнопки
+        new_w = max(1, event.width - self._LABEL_X - self._RIGHT_PAD)
+        try:
+            self._label.configure(width=new_w)
+        except Exception:
+            pass
+
     def _resolve_icon_font(self) -> str:
         try:
             import tkinter.font as tkfont
@@ -185,7 +224,8 @@ class NavButton(ctk.CTkFrame):
     def _ensure_bar(self):
         if self._bar_img_active is None:
             self._bar_img_active = grad_ctkimage(
-                3, self._height_px - 12, self._c1, self._c2, self._c3, radius=2
+                3, self._height_px - 12, self._c1, self._c2, self._c3,
+                radius=2,
             )
 
     # ------------------------------------------------------------------
