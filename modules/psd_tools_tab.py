@@ -370,6 +370,20 @@ class PsdToolsFrame(ttk.Frame):
         except Exception as e:
             self._log(f"Unlock failed: {e}", "error")
 
+    def unlock_layers(self):
+        """Разблокировать все слои (кнопка Unlock)."""
+        if not self._doc:
+            messagebox.showwarning(i18n.t("warning.title"), i18n.t("psd.no.doc"))
+            return
+        try:
+            self.unlock_all()
+            # обновляем дерево слоёв, чтобы статус блокировки перечитался
+            self.scan_layers()
+            messagebox.showinfo(i18n.t("info.title"), "Все слои разблокированы")
+        except Exception as e:
+            messagebox.showerror(i18n.t("error.title"), str(e))
+            self._log(f"Unlock failed: {e}", "error")
+
     def _read_so_true_size(self, so_layer=None) -> Optional[tuple[float, float]]:
         """
         Читает НАТИВНЫЙ размер вложенного контента SO (ключ "size").
@@ -387,8 +401,8 @@ class PsdToolsFrame(ttk.Frame):
     try {
         var ref = new ActionReference();
         ref.putEnumerated(charIDToTypeID("Lyr "),
-                         charIDToTypeID("Ordn"),
-                         charIDToTypeID("Trgt"));
+                          charIDToTypeID("Ordn"),
+                          charIDToTypeID("Trgt"));
         var lyrDesc = executeActionGet(ref);
 
         if (!lyrDesc.hasKey(stringIDToTypeID("smartObject"))) {
@@ -470,8 +484,8 @@ class PsdToolsFrame(ttk.Frame):
         jsx = r"""
 (function() {
     try {
-        executeAction(stringIDToTypeID("placedLayerEditContents"), 
-                     new ActionDescriptor(), DialogModes.NO);
+        executeAction(stringIDToTypeID("placedLayerEditContents"),
+                      new ActionDescriptor(), DialogModes.NO);
         var w = app.activeDocument.width.as('px');
         var h = app.activeDocument.height.as('px');
         app.activeDocument.close(SaveOptions.DONOTSAVECHANGES);
@@ -485,10 +499,10 @@ class PsdToolsFrame(ttk.Frame):
             if so_layer:
                 self._doc.ActiveLayer = so_layer
             result = self._ps.app.DoJavaScript(jsx)
-            
+
             raw_result = str(result).strip()
             self._log(f"[DEBUG] editContents raw result: '{raw_result}'", "info")
-            
+
             if not raw_result.startswith("ERR"):
                 parts = raw_result.split("|")
                 if len(parts) >= 2:
@@ -506,21 +520,21 @@ class PsdToolsFrame(ttk.Frame):
                     self._log(f"⚠ editContents returned invalid format: '{raw_result}'", "warn")
             else:
                 self._log(f"⚠ editContents returned error: {raw_result}", "warn")
-                
+
         except Exception as e:
             self._log(f"❌ Edit contents exception: {type(e).__name__}: {e}", "error")
             try:
                 import traceback
                 self._log(f"Traceback: {traceback.format_exc()}", "error")
-            except:
+            except Exception:
                 pass
-                
+
         return None
 
     def _replace_smart_object(self, so_layer, image_path: str, mode: str,
                               frame_key: Optional[str] = None,
                               isolate: bool = False) -> None:
-        """Заменить содержимое Smart Object с сохранением трансформаций"""
+        """Заменить содержимое Smart Object с сохранением трансформаций."""
         self._doc.ActiveLayer = so_layer
 
         fw = fh = 0
@@ -531,16 +545,16 @@ class PsdToolsFrame(ttk.Frame):
             self._log(f"✅ SO content frame: {fw}x{fh}px", "info")
         else:
             # Пробуем editContents как более точный fallback
-            self._log(f"⚠ JS true_size failed, trying editContents fallback", "warn")
+            self._log("⚠ JS true_size failed, trying editContents fallback", "warn")
             edit_size = self._read_so_size_via_edit_contents(so_layer)
-            
+
             if edit_size and edit_size[0] > 0 and edit_size[1] > 0:
                 fw = int(round(edit_size[0]))
                 fh = int(round(edit_size[1]))
                 self._log(f"✅ SO embedded size: {fw}x{fh}px (via editContents)", "ok")
             else:
                 # Последний fallback - bounds (НЕ РЕКОМЕНДУЕТСЯ для замены!)
-                self._log(f"⚠⚠ All SO size detection failed, using canvas bounds", "error")
+                self._log("⚠⚠ All SO size detection failed, using canvas bounds", "error")
                 try:
                     stored_frame = self._so_frames.get(frame_key) if frame_key else None
                     if stored_frame:
@@ -552,7 +566,7 @@ class PsdToolsFrame(ttk.Frame):
                     fw = int(round(fr - fl))
                     fh = int(round(fb - ft))
                     self._log(f"⚠⚠⚠ Using canvas bounds: {fw}x{fh}px - РЕЗУЛЬТАТ МОЖЕТ БЫТЬ НЕТОЧНЫМ!", "error")
-                    
+
                     # Показываем предупреждение пользователю
                     try:
                         messagebox.showwarning(
@@ -562,53 +576,59 @@ class PsdToolsFrame(ttk.Frame):
                             f"Результат может быть искажён.\n\n"
                             f"Рекомендация: пересохраните PSD."
                         )
-                    except:
+                    except Exception:
                         pass
                 except Exception as e:
                     self._log(f"❌ SO bounds read failed: {e}", "error")
                     fw = fh = 1000  # Default fallback
 
-        # Заменяем фото ИДЕНТИЧНО оригиналу: режим FILL БЕЗ padding
+        # === ФИКС: вставляем ТАК ЖЕ, как стоял оригинал ===
+        # Приводим фото к нативному размеру контента SO (fw×fh), чтобы
+        # placedLayerReplaceContents сохранил тот же масштаб и позицию.
+        #   - fill          → заполнить рамку с обрезкой лишнего
+        #   - fit/original  → вписать фото ЦЕЛИКОМ без обрезки (padding до fw×fh)
         prepared_path = image_path
         if PIL_AVAILABLE and fw > 0 and fh > 0:
-            prepared_path = self._prepare_image_for_psd(
-                image_path, fw, fh, mode="fill", force_mode="fill", use_padding=False
-            )
+            ui_mode = (mode or self._mode_var.get() or "fit").lower()
+            if ui_mode == "fill":
+                prepared_path = self._prepare_image_for_psd(
+                    image_path, fw, fh, mode="fill", force_mode="fill", use_padding=False
+                )
+            else:
+                prepared_path = self._prepare_image_for_psd(
+                    image_path, fw, fh, mode="fit", use_padding=True
+                )
 
-        stored = self._so_frames.get(frame_key) if frame_key else None
-        frame_literal = ",".join(f"{v:.3f}" for v in stored) if stored else "AUTO"
-
-        returned = self._run_so_replace_contents_jsx(
-            prepared_path, "exact", frame_literal, isolate=isolate,
+        self._run_so_replace_contents_jsx(
+            prepared_path, "exact", "AUTO", isolate=isolate,
         )
-        if frame_key and returned:
-            self._so_frames[frame_key] = returned
 
     def _run_so_replace_contents_jsx(
         self, image_path: str, fill_mode: str, frame: str, isolate: bool = False
     ):
         """
         Замена контента SO через placedLayerReplaceContents.
-        isolate=True: не затрагивает связанные копии (использует unique ID).
+        Команда сама сохраняет трансформацию слоя — FTcs не нужен.
+        Параметры fill_mode/frame/isolate оставлены для совместимости сигнатуры.
         """
         norm = str(Path(image_path).resolve()).replace("\\", "/")
 
         jsx_template = r"""
-(function() {{
-    try {{
-        var idplacedLayerReplaceContents = stringIDToTypeID("placedLayerReplaceContents");
+(function () {
+    try {
+        var id = stringIDToTypeID("placedLayerReplaceContents");
         var desc = new ActionDescriptor();
-        desc.putPath(charIDToTypeID("null"), new File("{image_path}"));
-        desc.putEnumerated(charIDToTypeID("FTcs"), charIDToTypeID("QCSt"),
-                          stringIDToTypeID("{fill_mode}"));
-        executeAction(idplacedLayerReplaceContents, desc, DialogModes.NO);
+        desc.putPath(charIDToTypeID("null"), new File("__IMAGE_PATH__"));
+        desc.putInteger(charIDToTypeID("PgNm"), 1);
+        executeAction(id, desc, DialogModes.NO);
         return "OK";
-    }} catch(e) {{
-        return "ERR:"+e.message;
-    }}
-}})();
+    } catch(e) {
+        return "ERR:" + e.message;
+    }
+})();
 """
-        jsx = jsx_template.format(image_path=norm, fill_mode=fill_mode)
+        # ВАЖНО: .replace, а не .format — в JSX есть свои фигурные скобки
+        jsx = jsx_template.replace("__IMAGE_PATH__", norm)
 
         try:
             result = str(self._ps.app.DoJavaScript(jsx))
@@ -652,7 +672,7 @@ class PsdToolsFrame(ttk.Frame):
         var desc1 = new ActionDescriptor();
         desc1.putPath(charIDToTypeID("null"), f);
         desc1.putEnumerated(charIDToTypeID("FTcs"), charIDToTypeID("QCSt"),
-                           charIDToTypeID("Qcsa"));
+                            charIDToTypeID("Qcsa"));
         var desc2 = new ActionDescriptor();
         desc2.putUnitDouble(charIDToTypeID("Hrzn"), charIDToTypeID("#Pxl"), {left});
         desc2.putUnitDouble(charIDToTypeID("Vrtc"), charIDToTypeID("#Pxl"), {top});
@@ -706,7 +726,7 @@ class PsdToolsFrame(ttk.Frame):
         try:
             from PIL import Image
             img = Image.open(image_path)
-            
+
             # Проверка размера исходника
             sw, sh = img.size
             if min(sw, sh) < self._MIN_SOURCE_SIDE and not self._small_source_ack:
@@ -962,7 +982,7 @@ class PsdToolsFrame(ttk.Frame):
                 if success > 0:
                     try:
                         self._doc.Close(2)
-                    except:
+                    except Exception:
                         pass
                     self._doc = self._ps.open(template_path)
                     self.scan_layers()
@@ -1011,7 +1031,7 @@ class PsdToolsFrame(ttk.Frame):
             messagebox.showinfo(i18n.t("info.title"), "CSV is empty")
             return
 
-        # Expected format: output_name, <layer_columns>
+        # Expected format: output_name,
         # Each cell in layer column = path to image file
         layer_columns = [c for c in rows_raw[0].keys() if c != "output_name"]
         if not layer_columns:
@@ -1053,7 +1073,7 @@ class PsdToolsFrame(ttk.Frame):
                 if idx > 1:
                     try:
                         self._doc.Close(2)
-                    except:
+                    except Exception:
                         pass
                     self._doc = self._ps.open(template_path)
                     self.scan_layers()
