@@ -76,7 +76,7 @@ class PsdToolsFrameCTk(ctk.CTkFrame):
         self._btn_open = self._btn_primary(toolbar, i18n.t("psd.open"), self.open_psd, width=150)
         self._btn_scan = self._btn_ghost(toolbar, i18n.t("psd.scan"), self.scan_layers, width=150)
         self._btn_unlck = self._btn_ghost(toolbar, i18n.t("psd.unlock"), self.unlock_all, width=180)
-        self._btn_repl = self._btn_ghost(toolbar, i18n.t("psd.replace"), self.replace_in_selected, width=210)
+        self._btn_repl = self._btn_ghost(toolbar, i18n.t("psd.replace"), self.replace_selected, width=210)
         for i, b in enumerate((self._btn_open, self._btn_scan, self._btn_unlck, self._btn_repl)):
             b.grid(row=0, column=i, padx=(10 if i == 0 else 6, 6), pady=(10, 5), sticky="w")
 
