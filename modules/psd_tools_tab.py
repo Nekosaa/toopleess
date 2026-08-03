@@ -708,8 +708,6 @@ class PsdToolsFrame(ttk.Frame):
         use_padding: bool = False,
     ) -> str:
         """Подготовка изображения: resize, padding, save"""
-        from modules.image_replace import prepare_image_for_psd
-
         out_dir = Path(self._psd_path).parent / "temp_prepared"
         out_dir.mkdir(exist_ok=True)
 
@@ -740,15 +738,25 @@ class PsdToolsFrame(ttk.Frame):
                     raise RuntimeError("User cancelled due to small source")
                 self._small_source_ack = True
 
-            # Resize
             if use_padding:
-                result_img = prepare_for_smart_object(img, target_width, target_height)
+                # НАСТОЯЩИЙ fit + padding: вписать фото ЦЕЛИКОМ, добить
+                # прозрачным полем до точного размера target (кадр как у оригинала).
+                fitted = resize_with_mode(
+                    img, target_width, target_height, mode="fit", no_upscale=no_upscale
+                )
+                if fitted.mode != "RGBA":
+                    fitted = fitted.convert("RGBA")
+                canvas = Image.new("RGBA", (target_width, target_height), (0, 0, 0, 0))
+                off_x = (target_width - fitted.size[0]) // 2
+                off_y = (target_height - fitted.size[1]) // 2
+                canvas.paste(fitted, (off_x, off_y), fitted)
+                result_img = canvas
             else:
                 result_img = resize_with_mode(
                     img, target_width, target_height, mode=effective_mode, no_upscale=no_upscale
                 )
 
-            # Save
+            # Save (PNG сохраняет прозрачность padding)
             result_img.save(str(out_path))
             self._log(f"✅ Saved prepared: {out_path.name} ({result_img.size[0]}x{result_img.size[1]}px)", "ok")
             return str(out_path)
